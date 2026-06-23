@@ -2,49 +2,50 @@
 
 Run a question through a multi-agent topology and see whether teamwork beats a single answer.
 
-A small Rust CLI and library on OMAR. You pick a topology (how many agents, and whether they reflect, debate, or vote); it spawns the agents, routes the prompts, collects the answers, and cleans up. Topologies come from the MASS paper (Zhou et al. 2025, arXiv:2502.02533). This covers the building blocks and a MATH benchmark, not the optimizer.
+You pick a topology (how many agents, and whether they reflect, debate, or vote); it spawns the agents, routes the prompts, collects the answers, and cleans up. Topologies come from the MASS paper (Zhou et al. 2025, arXiv:2502.02533), this covers the building blocks and a HARDMath benchmark.
 
 ## The building blocks
 
-Five, run in order: Summarize, Reflect, Debate, Aggregate, with Execute on the predictor. `aggregate` is how many agents answer in parallel. For MATH the final pick is a majority vote; pass `--aggregator llm` for an agent judge.
+Five, run in order: Summarize, Reflect, Debate, Aggregate, with Execute on the predictor. `aggregate` is how many agents answer in parallel. The final pick is a majority vote; pass `--aggregator llm` for an agent judge.
 
 ## Running it
 
 ```bash
 # one question through a topology
-omar-mass run --topology '{"aggregate":9}' --question "..."
+omar-mass run --topology '{"aggregate":5}' --question "..."
 omar-mass run --topology '{"debate":2,"aggregate":3}' --aggregator llm --question "..."
 
 # try one block on a tiny built-in example
 omar-mass demo-block --block aggregate
 
-# MATH benchmark (100-problem subset in data/math_subset.jsonl)
-omar-mass bench --method cot --n 20        # single answer
-omar-mass bench --method sc9 --n 20        # 9 answers, majority vote
-omar-mass bench --method reflect --n 20    # self-refine: answer, critique, revise
-omar-mass bench --method mad --n 20        # 3 agents, 3 rounds, judge
-omar-mass bench --method sc9-tuned --n 20  # sc9 with the paper's tuned prompt
+# HARDMath benchmark (300-problem subset in data/hardmath_subset.jsonl)
+omar-mass bench --method cot --n 100          # single answer
+omar-mass bench --method self-refine --n 100  # answer, critique, revise
+omar-mass bench --method sc5 --n 100          # 5 answers, LLM aggregator picks
+omar-mass bench --method debate --n 100       # 3 agents, 2 rounds, LLM judge
 
 # pick the backend and model
-omar-mass bench --method cot --n 20 --backend opencode --model deepseek-v3
+omar-mass bench --method cot --n 100 --backend opencode --model deepseek-v3
 
 # kill agents a crashed run left behind
 omar-mass teardown
 ```
 
-Every run is capped at 10 agent calls, the same limit the paper uses. On a memory-bound machine, add `--max-concurrent 1` so a wide topology like SC@5 runs its agents one at a time.
+Each method is capped at 10 agent calls, the same limit the paper uses (the grader call is separate). On a memory-bound machine, add `--max-concurrent 1` so a wide topology like SC@5 runs its agents one at a time.
+
+## Grading
+
+Answers are scored by an LLM judge (arXiv:2410.09988), not a normalizer. One grader call per problem sees the predicted answer plus the ground-truth solution and a per-type rubric, and returns a 0-1 score. Accuracy is the mean score (partial credit). Because the judge has the gold solution, Haiku is a strong enough grader.
 
 ## Notes
 
-Run it from a folder your backend CLI already trusts, or a first-run trust prompt will hang the spawn. It finds the omar binary via `OMAR_BIN`, then next to itself, then PATH.
+`data/hardmath_subset.jsonl` has 300 problems, 50 per question_type, from HARDMath. `--seed N` rotates the slice; the same seed gives every method the same problems. Rebuild with `scripts/prepare_hardmath.py`.
 
-`data/math_subset.jsonl` has 100 problems, 20 per difficulty level, from MATH-500. `--seed N` rotates the slice; `--stratified` spreads it across all five levels.
-
-`cargo test -p omar-mass` covers the parsers, normalizer, topology math, and mailbox. The real-agent smoke test is `tests/ci/mass_math_smoke.sh`, run only when `OMAR_MASS_E2E=1`.
+`cargo test -p omar-mass` covers the parsers, judge, topology math, and mailbox. The smoke test is `tests/ci/mass_hardmath_smoke.sh`, run only when `OMAR_MASS_E2E=1`.
 
 ## Limitations
 
-A couple of things we hit. Haiku gets pricey on the wide topologies, since SC@9 fires nine calls per question and that adds up fast across a full run. Going cheap with a local model was the opposite problem: too slow to be practical, because each agent takes a couple of minutes to start and the wide topologies serialize through one model server. We are still hunting for a backbone that is cheap, fast, and weak enough to leave the topologies something to improve.
+The rule-based majority vote buckets answers by a crude string normalization, which can't match equivalent open-form HARDMath expressions, so SC@5 uses the LLM aggregator instead (6 calls). Local models are too slow to be practical: each agent takes a couple of minutes to start and wide topologies serialize through one model server.
 
 ## Acknowledgments
 

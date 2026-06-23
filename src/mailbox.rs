@@ -1,6 +1,5 @@
-//! File mailbox between the runner and agents.
-//! Requests are JSON envelopes under <run_dir>/inbox/; agents write replies to
-//! <run_dir>/outbox/ atomically (tmp + rename). The runner polls reply paths.
+//! File mailbox: requests are JSON envelopes under <run_dir>/inbox/; agents
+//! write replies to <run_dir>/outbox/ atomically. The runner polls reply paths.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -67,10 +66,8 @@ pub enum WaitOutcome {
     TimedOut,
 }
 
-/// Wait until every path exists and is non-empty, or timeout elapses.
-/// on_nudge fires for each pending path so the caller can re-send the request:
-/// first after nudge_after, then every nudge_every. Recovers a dropped
-/// notification instead of stalling the wave on one straggler.
+/// Wait until every path exists and is non-empty, or timeout elapses. on_nudge
+/// fires per pending path (after nudge_after, then every nudge_every) to re-send.
 pub fn wait_for_files(
     paths: &[PathBuf],
     timeout: Duration,

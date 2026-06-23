@@ -15,6 +15,7 @@ pub enum Role {
     Debator,
     Summarizer,
     Executor,
+    Grader,
 }
 
 impl Role {
@@ -28,6 +29,7 @@ impl Role {
             Role::Debator => "deb",
             Role::Summarizer => "sum",
             Role::Executor => "exec",
+            Role::Grader => "grade",
         }
     }
 }
@@ -55,18 +57,10 @@ pub struct Envelope {
     pub reply_path: String,
 }
 
-/// Reply parsed from the agent's reply file. Parsing is lenient: a
-/// bare-text file is accepted as `content` so a quoting slip doesn't lose
-/// the inference.
+/// Reply parsed from the agent's reply file: only `content` is consumed.
+/// Lenient: bare text is accepted as content so a quoting slip isn't lost.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Reply {
-    /// Echo of the request id; not used for routing.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub id: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub sender: String,
     pub content: String,
 }
 
@@ -85,8 +79,6 @@ impl Reply {
             }
         }
         Reply {
-            id: String::new(),
-            sender: String::new(),
             content: raw.to_string(),
         }
     }
@@ -108,8 +100,9 @@ pub fn parse_answer(text: &str) -> Option<String> {
             None => break,
         }
     }
-    if let Some((start, end)) = last {
-        let answer = text[start..end].trim();
+    // Indices come from the lowercased copy; get() avoids a panic if a
+    // length-changing lowercase ever shifts them off a char boundary.
+    if let Some(answer) = last.and_then(|(s, e)| text.get(s..e)).map(str::trim) {
         if !answer.is_empty() {
             return Some(answer.to_string());
         }
@@ -140,15 +133,25 @@ pub fn parse_answer(text: &str) -> Option<String> {
     extract_last_boxed(text)
 }
 
+/// Parse the judge's 0-1 score from its output, clamped to [0,1]. Reuses the
+/// answer parser (tags, then `\boxed{}`) and reads the first float in it.
+pub fn parse_score(text: &str) -> Option<f64> {
+    let raw = parse_answer(text)?;
+    let num: String = raw
+        .trim_start_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    num.parse::<f64>().ok().map(|v| v.clamp(0.0, 1.0))
+}
+
 /// Content of the last brace-balanced `\boxed{...}`, if any.
 fn extract_last_boxed(text: &str) -> Option<String> {
     extract_last_braced(text, "\\boxed{")
 }
 
-/// Content of the last brace-balanced `<tag>...}` occurrence, where `tag`
-/// ends in the opening `{` (e.g. `"\\boxed{"`, `"\\answer{"`). Handles nested
-/// braces (e.g. `\boxed{\frac{1}{2}}`); UTF-8 safe since only ASCII `{`/`}`
-/// are matched.
+/// Content of the last brace-balanced `<tag>...}` where `tag` ends in `{`
+/// (e.g. `"\\boxed{"`). Handles nested braces; UTF-8 safe (matches ASCII only).
 fn extract_last_braced(text: &str, tag: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut result = None;
@@ -189,9 +192,8 @@ pub struct Reflection {
     pub feedback: String,
 }
 
-/// Parse a reflector output. `correct` is true when the last
-/// `Correctness:` line contains "true". Feedback is the last `Feedback:`
-/// section, or the whole text if absent.
+/// Parse a reflector output: `correct` is true when the last `Correctness:`
+/// line says "true"; feedback is the last `Feedback:` section, else whole text.
 pub fn parse_reflection(text: &str) -> Reflection {
     let mut correct = false;
     let mut feedback_start: Option<usize> = None;
@@ -221,11 +223,10 @@ pub fn parse_reflection(text: &str) -> Reflection {
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
+    // get(..len) is None at a non-char-boundary, so multibyte heads can't panic.
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
 }
 
 fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
@@ -307,6 +308,33 @@ mod tests {
     }
 
     #[test]
+    fn parsers_handle_multibyte_chars_without_panic() {
+        // A line whose Nth byte is inside a multibyte char must not panic the
+        // prefix/score parsers (regression: HARDMath answers are full of epsilon).
+        assert!(parse_reflection("Reason ε = 6^{-5/4}\nCorrectness: False")
+            .feedback
+            .contains('ε'));
+        assert_eq!(
+            parse_answer("Answer ε\n<answer>ε=0.14</answer>").as_deref(),
+            Some("ε=0.14")
+        );
+        assert_eq!(
+            parse_score("the grade is ε... <answer>0.0</answer>"),
+            Some(0.0)
+        );
+        assert_eq!(parse_answer("Answerε is here"), None);
+    }
+
+    #[test]
+    fn parse_score_reads_float_and_clamps() {
+        assert_eq!(parse_score("Grade: \\boxed{1.0}"), Some(1.0));
+        assert_eq!(parse_score("<answer>0.5</answer>"), Some(0.5));
+        assert_eq!(parse_score("score is \\boxed{0}"), Some(0.0));
+        assert_eq!(parse_score("\\boxed{1.5}"), Some(1.0));
+        assert_eq!(parse_score("no score here"), None);
+    }
+
+    #[test]
     fn parse_reflection_true_verdict() {
         let text = "Reasoning: looks right.\nFeedback: clean derivation.\nCorrectness: True";
         let r = parse_reflection(text);
@@ -330,9 +358,9 @@ mod tests {
 
     #[test]
     fn reply_parses_json_and_bare_text() {
+        // Extra id/sender keys are ignored; only content is consumed.
         let json = r#"{"id":"x","sender":"pred-1","content":"<answer>5</answer>"}"#;
         let reply = Reply::parse(json);
-        assert_eq!(reply.sender, "pred-1");
         assert_eq!(reply.content, "<answer>5</answer>");
 
         let bare = Reply::parse("plain text <answer>7</answer>");

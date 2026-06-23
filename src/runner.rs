@@ -1,14 +1,10 @@
-//! The MASS composer/runner.
-//! Spawns one persistent OMAR agent per (role, chain-slot), routes block
-//! waves through the file mailbox in order [summarize, reflect, debate,
-//! aggregate] (plus execute on the predictor), parses the final <answer>,
-//! and tears every agent down. See PLAN.md sections 5 and 6 for the design.
+//! The MASS composer/runner: spawns one persistent OMAR agent per (role, slot),
+//! routes block waves through the mailbox, parses <answer>, tears agents down.
 
 use crate::blocks::{self, CallSpec};
 use crate::mailbox::{self, RunDir, WaitOutcome};
 use crate::math;
 use crate::omar::OmarClient;
-use crate::prompts::PredictorKind;
 use crate::protocol::{self, Envelope, Reply, Role};
 use crate::topology::{AggregatorMode, SessionSpec, TopologyConfig};
 use anyhow::{bail, Context, Result};
@@ -16,15 +12,28 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Budget per readiness attempt. Must clear a slow cold-start: a local 7B
-/// processing the ~7k-token charter takes ~100-120s, and wide topologies
-/// share one model server so several charters prefill at once.
-const READY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Budget per readiness attempt: cloud agents ready in seconds; a local model
+/// server cold-starts far slower (~100-120s), so it gets a much larger budget.
+const READY_TIMEOUT_CLOUD: Duration = Duration::from_secs(90);
+const READY_TIMEOUT_LOCAL: Duration = Duration::from_secs(600);
 /// How many times to respawn a laggard before failing the instance.
 const MAX_READY_ATTEMPTS: usize = 4;
+/// Re-point a not-yet-ready agent at its charter on this cadence; the spawn-time
+/// keystrokes can be lost in the CLI boot race, and the charter is idempotent.
+const READY_NUDGE_AFTER: Duration = Duration::from_secs(15);
+const READY_NUDGE_EVERY: Duration = Duration::from_secs(15);
+
+/// Readiness budget for a backend: only opencode fronts a slow local model
+/// server (LM Studio / Ollama); every other backend is a fast cloud CLI.
+fn ready_attempt_timeout(backend: &str) -> Duration {
+    match backend {
+        "opencode" => READY_TIMEOUT_LOCAL,
+        _ => READY_TIMEOUT_CLOUD,
+    }
+}
 const POLL_INTERVAL: Duration = Duration::from_millis(2000);
 /// Re-nudge a stuck request only well past any plausible solve time, so a
-/// working agent that is still solving is never interrupted.
+/// still-working agent is never interrupted.
 const DISPATCH_NUDGE_AFTER: Duration = Duration::from_secs(180);
 const DISPATCH_NUDGE_EVERY: Duration = Duration::from_secs(60);
 
@@ -62,14 +71,15 @@ pub struct TaskInstance {
 pub struct RunnerOptions {
     pub topology: TopologyConfig,
     pub aggregator: AggregatorMode,
-    pub predictor: PredictorKind,
     pub model: ModelConfig,
     /// Per-wave reply timeout.
     pub timeout: Duration,
-    /// Max agents resident at once (0 = unlimited). Below a wave's width, the
-    /// wave runs in sequential batches over a small pool, resetting between
-    /// them. Lets a memory-bound host run wide topologies like SC@5 on 16GB.
+    /// Max agents resident at once (0 = unlimited); wider waves run in
+    /// sequential batches, letting a memory-bound host run SC@5 on 16GB.
     pub max_concurrent: usize,
+    /// Spawn a dedicated grader agent for the LLM-judge scoring pass (bench
+    /// only; `run`/`demo-block` leave it off to skip an unused agent).
+    pub with_grader: bool,
     /// Override the run-dir root (default $OMAR_DIR or $HOME/.omar, + mass/runs).
     pub run_root: Option<PathBuf>,
 }
@@ -151,10 +161,17 @@ impl Runner {
         let mut mcp = OmarClient::start()?;
 
         // Cap resident agents at max_concurrent; wider waves batch in dispatch.
-        let sessions = cap_sessions(
+        let mut sessions = cap_sessions(
             opts.topology.session_specs(opts.aggregator),
             opts.max_concurrent,
         );
+        // One dedicated grader agent (slot 0) for the LLM-judge scoring pass.
+        if opts.with_grader {
+            sessions.push(SessionSpec {
+                role: Role::Grader,
+                slot: 0,
+            });
+        }
         let project_id = mcp.add_project(&format!("mass-{run_id}"))?;
         mcp.log_justification(
             "omar-mass",
@@ -198,9 +215,8 @@ impl Runner {
     fn spawn_specs(&mut self, specs: &[SessionSpec]) -> Result<()> {
         // Kill any stale agent reusing one of our deterministic names.
         let existing = self.mcp.list_agents().unwrap_or_default();
-        // Run from the invoking dir, not the run dir: backend CLIs gate unknown
-        // folders behind a trust prompt that would deadlock the spawn. Mailbox
-        // paths are absolute, so any working dir is fine.
+        // Run from the invoking dir: backend CLIs gate unknown folders behind a
+        // trust prompt that would deadlock the spawn (mailbox paths are absolute).
         let workdir = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .display()
@@ -230,12 +246,12 @@ impl Runner {
         Ok(())
     }
 
-    /// Block until every agent is ready, respawning laggards between attempts.
-    /// A weak backend sometimes skips the touch handshake, and a respawn
-    /// recovers it where waiting longer would not.
+    /// Block until every agent is ready, respawning laggards between attempts
+    /// (a weak backend sometimes skips the handshake; a respawn recovers it).
     fn ensure_ready(&mut self) -> Result<()> {
+        let timeout = ready_attempt_timeout(&self.opts.model.backend);
         for attempt in 1..=MAX_READY_ATTEMPTS {
-            let missing = self.wait_ready_once(READY_ATTEMPT_TIMEOUT);
+            let missing = self.wait_ready_once(timeout);
             if missing.is_empty() {
                 return Ok(());
             }
@@ -269,7 +285,7 @@ impl Runner {
             .collect();
         // Ready files are empty markers, so poll for existence directly.
         let start = std::time::Instant::now();
-        let mut nudged = vec![false; paths.len()];
+        let mut last_nudge: Option<std::time::Instant> = None;
         loop {
             let missing: Vec<usize> = paths
                 .iter()
@@ -280,22 +296,22 @@ impl Runner {
             if missing.is_empty() || start.elapsed() >= timeout {
                 return missing;
             }
-            // Halfway through, re-point laggards at their on-disk charter in
-            // case the spawn-time delivery was swallowed.
-            if start.elapsed() >= timeout / 2 {
+            // Re-point still-missing agents at their charter on a fixed cadence;
+            // repeated (not one-shot) so a nudge lost to the boot race is retried.
+            if start.elapsed() >= READY_NUDGE_AFTER
+                && last_nudge.is_none_or(|t| t.elapsed() >= READY_NUDGE_EVERY)
+            {
+                last_nudge = Some(std::time::Instant::now());
                 for &i in &missing {
-                    if !nudged[i] {
-                        nudged[i] = true;
-                        let name = self.sessions[i].short_name(&self.run_id);
-                        let charter_path = self.run_dir.charter(&name);
-                        let _ = self.mcp.send_input(
-                            &name,
-                            &format!(
-                                "Your task: read the file {} and follow it exactly.",
-                                charter_path.display()
-                            ),
-                        );
-                    }
+                    let name = self.sessions[i].short_name(&self.run_id);
+                    let charter_path = self.run_dir.charter(&name);
+                    let _ = self.mcp.send_input(
+                        &name,
+                        &format!(
+                            "Your task: read the file {} and follow it exactly.",
+                            charter_path.display()
+                        ),
+                    );
                 }
             }
             std::thread::sleep(POLL_INTERVAL);
@@ -306,9 +322,8 @@ impl Runner {
         SessionSpec { role, slot }.short_name(&self.run_id)
     }
 
-    /// Dispatch a wave, honoring max_concurrent. A wave that fits runs as one
-    /// parallel batch; a wider wave runs in sequential batches with a pool
-    /// reset between them. Returns replies in the original wave order.
+    /// Dispatch a wave honoring max_concurrent: a wave that fits runs in one
+    /// parallel batch, a wider one in sequential batches. Replies stay in order.
     fn dispatch(
         &mut self,
         task_id: &str,
@@ -433,11 +448,8 @@ impl Runner {
         results
     }
 
-    /// Reset the pool so the next problem is an independent, stateless run,
-    /// matching the paper. We reuse persistent agents for speed, so without
-    /// this they would carry prior transcripts forward and bias later answers.
-    /// Kill and respawn through the verified path rather than /clear, which
-    /// races the backend's popup and wedges the pane.
+    /// Reset the pool so the next problem is independent (reused agents would
+    /// otherwise carry prior transcripts forward). Respawn, not /clear.
     fn reset_agents(&mut self) -> Result<()> {
         self.spawn_pool()?;
         self.ensure_ready()
@@ -446,8 +458,8 @@ impl Runner {
     /// Run one task through the topology and return the final answer. Also
     /// persisted under <run_dir>/results/<task_id>.json.
     pub fn run_instance(&mut self, task: &TaskInstance) -> Result<InstanceResult> {
-        // Reset before each problem so it is independent. The first problem
-        // already runs against the fresh charters written at setup.
+        // Reset before each problem so every instance starts from a fresh
+        // charter with no carried-over context (true statelessness).
         if !self.fresh {
             self.reset_agents()
                 .with_context(|| format!("Failed to reset agents before task {}", task.id))?;
@@ -476,7 +488,7 @@ impl Runner {
         }
 
         // -- Predict (the parallel part of Aggregate) ---------------------
-        let wave = blocks::predict_wave(self.opts.predictor, width, &question, &summaries);
+        let wave = blocks::predict_wave(width, &question, &summaries);
         let replies = self.dispatch(&task.id, &wave, &mut records);
         let mut texts: Vec<String> = vec![String::new(); width];
         let mut answers: Vec<String> = vec![String::new(); width];
@@ -598,6 +610,21 @@ impl Runner {
         Ok(result)
     }
 
+    /// LLM-judge grade: score a predicted answer against the gold solution.
+    /// One grader call; returns a 0-1 score, or None if the grader failed.
+    pub fn grade(
+        &mut self,
+        task_id: &str,
+        predicted: &str,
+        solution: &str,
+        question_type: &str,
+    ) -> Option<f64> {
+        let call = blocks::judge_call(predicted, solution, question_type);
+        let mut records = Vec::new();
+        let replies = self.dispatch(task_id, &[call], &mut records);
+        replies[0].as_deref().and_then(protocol::parse_score)
+    }
+
     /// Kill every agent of this run and complete the project. Idempotent;
     /// also called best-effort on drop.
     pub fn teardown(&mut self) -> Result<()> {
@@ -710,6 +737,14 @@ mod tests {
         // The agent must stay passive, or it goes busy and misses requests.
         assert!(text.contains("NEVER write a loop"));
         assert!(text.contains("end your turn"));
+    }
+
+    #[test]
+    fn ready_timeout_is_short_for_cloud_long_for_local() {
+        assert_eq!(ready_attempt_timeout("claude"), READY_TIMEOUT_CLOUD);
+        assert_eq!(ready_attempt_timeout("agy"), READY_TIMEOUT_CLOUD);
+        assert_eq!(ready_attempt_timeout("opencode"), READY_TIMEOUT_LOCAL);
+        assert!(READY_TIMEOUT_CLOUD < READY_TIMEOUT_LOCAL);
     }
 
     #[test]

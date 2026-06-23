@@ -1,77 +1,55 @@
-//! MATH validation harness: runs a baseline method over a dataset subset
-//! and scores it against gold answers. Relative comparison only, see
-//! VALIDATION.md.
+//! HARDMath validation harness: run a method over the subset, score each
+//! answer with the LLM judge (arXiv:2410.09988); accuracy = mean score.
 
-use crate::prompts::PredictorKind;
+use crate::mailbox;
 use crate::runner::{InstanceResult, ModelConfig, Runner, RunnerOptions, TaskInstance};
 use crate::topology::{AggregatorMode, TopologyConfig};
-use crate::{mailbox, math};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Baseline methods from the paper (App. B.2), expressed as topologies.
+/// The four baseline methods, expressed as topologies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Method {
     /// Chain-of-thought: a single predictor.
     Cot,
-    /// Self-consistency @9: Aggregate-9 with rule-based majority vote.
-    Sc9,
-    /// Multi-agent debate: 3 agents x 3 rounds + aggregator (10 calls).
-    Mad,
-    /// Self-refine: predictor + 4 reflect rounds (worst case 9 calls).
-    Reflect,
-    /// SC@9 with the paper's App. E tuned predictor prompt (the MASS-found
-    /// MATH topology, Table 2).
-    #[value(name = "sc9-tuned")]
-    Sc9Tuned,
+    /// Self-refine: predictor + up to 4 reflect rounds.
+    #[value(name = "self-refine")]
+    SelfRefine,
+    /// Self-consistency @5: 5 parallel predictors, LLM aggregator picks the
+    /// most consistent answer (rule vote can't match open-form expressions).
+    Sc5,
+    /// Multi-agent debate: 3 agents x 2 rounds + LLM aggregator (10 calls).
+    Debate,
 }
 
 impl Method {
-    pub fn preset(&self) -> (TopologyConfig, AggregatorMode, PredictorKind) {
+    pub fn preset(&self) -> (TopologyConfig, AggregatorMode) {
         match self {
-            Method::Cot => (
+            Method::Cot => (TopologyConfig::default(), AggregatorMode::Rule),
+            Method::SelfRefine => (
                 TopologyConfig {
-                    aggregate: 1,
+                    reflect: 4,
                     ..Default::default()
                 },
                 AggregatorMode::Rule,
-                PredictorKind::Cot,
             ),
-            Method::Sc9 => (
+            Method::Sc5 => (
                 TopologyConfig {
-                    aggregate: 9,
+                    aggregate: 5,
                     ..Default::default()
                 },
-                AggregatorMode::Rule,
-                PredictorKind::Cot,
+                AggregatorMode::Llm,
             ),
-            Method::Mad => (
+            Method::Debate => (
                 TopologyConfig {
                     aggregate: 3,
                     debate: 2,
                     ..Default::default()
                 },
                 AggregatorMode::Llm,
-                PredictorKind::Cot,
-            ),
-            Method::Reflect => (
-                TopologyConfig {
-                    aggregate: 1,
-                    reflect: 4,
-                    ..Default::default()
-                },
-                AggregatorMode::Rule,
-                PredictorKind::Cot,
-            ),
-            Method::Sc9Tuned => (
-                TopologyConfig {
-                    aggregate: 9,
-                    ..Default::default()
-                },
-                AggregatorMode::Rule,
-                PredictorKind::Optimized,
             ),
         }
     }
@@ -79,27 +57,26 @@ impl Method {
     pub fn name(&self) -> &'static str {
         match self {
             Method::Cot => "cot",
-            Method::Sc9 => "sc9",
-            Method::Mad => "mad",
-            Method::Reflect => "reflect",
-            Method::Sc9Tuned => "sc9-tuned",
+            Method::SelfRefine => "self-refine",
+            Method::Sc5 => "sc5",
+            Method::Debate => "debate",
         }
     }
 }
 
-/// One MATH problem from `data/math_subset.jsonl`.
+/// One HARDMath problem from `data/hardmath_subset.jsonl`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct MathProblem {
+pub struct Problem {
     pub id: String,
-    pub problem: String,
+    pub question: String,
+    /// Ground-truth worked solution, handed to the LLM judge.
+    pub solution: String,
+    /// Final gold answer, for logging.
     pub answer: String,
-    #[serde(default)]
-    pub subject: String,
-    #[serde(default)]
-    pub level: u32,
+    pub question_type: String,
 }
 
-pub fn load_problems(path: &Path) -> Result<Vec<MathProblem>> {
+pub fn load_problems(path: &Path) -> Result<Vec<Problem>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read dataset {}", path.display()))?;
     let mut problems = Vec::new();
@@ -107,7 +84,7 @@ pub fn load_problems(path: &Path) -> Result<Vec<MathProblem>> {
         if line.trim().is_empty() {
             continue;
         }
-        let problem: MathProblem = serde_json::from_str(line)
+        let problem: Problem = serde_json::from_str(line)
             .with_context(|| format!("Bad JSONL line {} in {}", i + 1, path.display()))?;
         problems.push(problem);
     }
@@ -117,9 +94,7 @@ pub fn load_problems(path: &Path) -> Result<Vec<MathProblem>> {
     Ok(problems)
 }
 
-/// Deterministic subset selection: rotate by seed, take n. The vendored
-/// subset is sorted by level, so a contiguous slice is not difficulty
-/// balanced. Use select_stratified for a representative subset.
+/// Deterministic subset selection: rotate by seed, take n.
 pub fn select<T: Clone>(items: &[T], n: usize, seed: u64) -> Vec<T> {
     let len = items.len();
     let n = n.min(len);
@@ -127,68 +102,38 @@ pub fn select<T: Clone>(items: &[T], n: usize, seed: u64) -> Vec<T> {
     (0..n).map(|i| items[(start + i) % len].clone()).collect()
 }
 
-/// Difficulty-balanced subset: take ~n/levels problems from each level so a
-/// run spans L1..L5 instead of the all-easy head. Deterministic in seed, and
-/// consecutive seeds pick disjoint per-level windows, so every topology on the
-/// same seed sees the same set while different seeds give different sets.
-pub fn select_stratified(problems: &[MathProblem], n: usize, seed: u64) -> Vec<MathProblem> {
-    use std::collections::BTreeMap;
-    let n = n.min(problems.len());
-    let mut by_level: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-    for (i, p) in problems.iter().enumerate() {
-        by_level.entry(p.level).or_default().push(i);
-    }
-    if by_level.is_empty() {
-        return Vec::new();
-    }
-    let num_levels = by_level.len();
-    let base = n / num_levels;
-    let mut remainder = n % num_levels;
-    let mut out = Vec::with_capacity(n);
-    for idxs in by_level.values() {
-        // Distribute any remainder to the lowest levels first.
-        let mut k = base;
-        if remainder > 0 {
-            k += 1;
-            remainder -= 1;
-        }
-        let k = k.min(idxs.len());
-        if k == 0 {
-            continue;
-        }
-        let len = idxs.len();
-        let start = (seed as usize).wrapping_mul(k) % len;
-        for j in 0..k {
-            out.push(problems[idxs[(start + j) % len]].clone());
-        }
-    }
-    out
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredInstance {
     pub task_id: String,
-    pub subject: String,
-    pub level: u32,
+    pub question_type: String,
     pub gold: String,
     pub predicted: Option<String>,
-    pub correct: bool,
+    /// Judge score in [0,1].
+    pub score: f64,
     pub llm_calls: usize,
     pub failures: usize,
 }
 
-#[derive(Debug, Serialize)]
+/// Per-question-type breakdown (mean score over that type's instances).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeStats {
+    pub n: usize,
+    pub accuracy: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BenchSummary {
     pub method: String,
     pub backend: String,
     pub model: Option<String>,
-    /// Effective parallel-chain width actually run (after any -k override),
-    /// so the summary records SC@5 vs SC@9 regardless of method label.
+    /// Parallel-chain width actually run.
     pub aggregate: usize,
     pub n: usize,
     pub seed: u64,
-    pub correct: usize,
+    /// Mean judge score across instances.
     pub accuracy: f64,
+    /// Mean score per question_type (some rubrics, e.g. ODE, score much lower).
+    pub by_type: BTreeMap<String, TypeStats>,
     pub total_llm_calls: usize,
     pub total_failures: usize,
     pub run_id: String,
@@ -200,171 +145,212 @@ pub struct BenchArgs {
     pub data: PathBuf,
     pub n: usize,
     pub seed: u64,
-    /// Restrict to a single difficulty level before selection (e.g. `5` =
-    /// hardest-only). `None` keeps all levels.
-    pub level: Option<u32>,
-    /// Balance the subset across difficulty levels (see
-    /// [`select_stratified`]) instead of taking a contiguous slice.
-    pub stratified: bool,
-    /// Override the preset's parallel-chain width (e.g. SC@5 = sc9 method
-    /// with `aggregate_k = 5`). Must be a legal width or the run bails.
-    pub aggregate_k: Option<usize>,
     /// Max agents resident/called at once (0 = unlimited). Below a wave's
-    /// width, the wave runs in sequential batches, which lets a memory-bound
-    /// host run wide topologies like SC@5 locally.
+    /// width, the wave runs in sequential batches.
     pub max_concurrent: usize,
+    /// Resume a previous run: load the partial file and skip done problems.
+    pub resume: bool,
     pub model: ModelConfig,
     pub timeout: Duration,
     pub out: Option<PathBuf>,
 }
 
-/// Apply an optional aggregate-width override to a preset topology,
-/// re-validating dimensions and the LLM-call cap so a bad `-k` fails before
-/// any agent spawns.
-pub fn apply_aggregate_k(
-    mut topology: TopologyConfig,
-    aggregate_k: Option<usize>,
-    aggregator: AggregatorMode,
-) -> Result<TopologyConfig> {
-    if let Some(k) = aggregate_k {
-        topology.aggregate = k;
-        topology.validate()?;
-        topology.check_cap(aggregator)?;
+fn make_summary(
+    args: &BenchArgs,
+    aggregate: usize,
+    instances: &[ScoredInstance],
+    run_id: &str,
+) -> BenchSummary {
+    let total_score: f64 = instances.iter().map(|s| s.score).sum();
+    let mut sums: BTreeMap<String, (usize, f64)> = BTreeMap::new();
+    for s in instances {
+        let e = sums.entry(s.question_type.clone()).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += s.score;
     }
-    Ok(topology)
-}
-
-pub fn run_bench(args: BenchArgs) -> Result<BenchSummary> {
-    let mut problems = load_problems(&args.data)?;
-    if let Some(level) = args.level {
-        problems.retain(|p| p.level == level);
-        if problems.is_empty() {
-            bail!("Dataset has no problems at level {level}");
-        }
-    }
-    let subset = if args.stratified {
-        select_stratified(&problems, args.n, args.seed)
-    } else {
-        select(&problems, args.n, args.seed)
-    };
-    let (topology, aggregator, predictor) = args.method.preset();
-    let topology = apply_aggregate_k(topology, args.aggregate_k, aggregator)?;
-
-    eprintln!(
-        "[mass] bench method={} n={} seed={} topology={:?} backend={} model={:?}",
-        args.method.name(),
-        subset.len(),
-        args.seed,
-        topology,
-        args.model.backend,
-        args.model.model
-    );
-
-    let mut runner = Runner::setup(RunnerOptions {
-        topology,
-        aggregator,
-        predictor,
-        model: args.model.clone(),
-        timeout: args.timeout,
-        max_concurrent: args.max_concurrent,
-        run_root: None,
-    })?;
-    eprintln!(
-        "[mass] run {} ready ({} agents); results under {}",
-        runner.run_id,
-        topology.session_specs(aggregator).len(),
-        runner.run_dir.root.display()
-    );
-
-    let mut instances = Vec::new();
-    let total = subset.len();
-    for (i, problem) in subset.iter().enumerate() {
-        let task = TaskInstance {
-            id: problem.id.clone(),
-            question: problem.problem.clone(),
-            context: None,
-            tests: None,
-        };
-        let outcome = runner.run_instance(&task);
-        let scored = match outcome {
-            Ok(InstanceResult {
-                answer,
-                llm_calls,
-                failures,
-                ..
-            }) => {
-                let correct = answer
-                    .as_deref()
-                    .is_some_and(|a| math::answers_equal(a, &problem.answer));
-                ScoredInstance {
-                    task_id: problem.id.clone(),
-                    subject: problem.subject.clone(),
-                    level: problem.level,
-                    gold: problem.answer.clone(),
-                    predicted: answer,
-                    correct,
-                    llm_calls,
-                    failures,
-                }
-            }
-            Err(err) => {
-                eprintln!("[mass] instance {} failed: {err:#}", problem.id);
-                ScoredInstance {
-                    task_id: problem.id.clone(),
-                    subject: problem.subject.clone(),
-                    level: problem.level,
-                    gold: problem.answer.clone(),
-                    predicted: None,
-                    correct: false,
-                    llm_calls: 0,
-                    failures: 0,
-                }
-            }
-        };
-        eprintln!(
-            "[mass] [{}/{}] {} gold={} predicted={:?} correct={}",
-            i + 1,
-            total,
-            problem.id,
-            problem.answer,
-            scored.predicted,
-            scored.correct
-        );
-        instances.push(scored);
-    }
-
-    let correct = instances.iter().filter(|s| s.correct).count();
-    let summary = BenchSummary {
+    let by_type = sums
+        .into_iter()
+        .map(|(t, (n, sum))| {
+            (
+                t,
+                TypeStats {
+                    n,
+                    accuracy: sum / n as f64,
+                },
+            )
+        })
+        .collect();
+    BenchSummary {
         method: args.method.name().to_string(),
         backend: args.model.backend.clone(),
         model: args.model.model.clone(),
-        aggregate: topology.aggregate,
+        aggregate,
         n: instances.len(),
         seed: args.seed,
-        correct,
-        accuracy: correct as f64 / instances.len().max(1) as f64,
+        accuracy: total_score / instances.len().max(1) as f64,
+        by_type,
         total_llm_calls: instances.iter().map(|s| s.llm_calls).sum(),
         total_failures: instances.iter().map(|s| s.failures).sum(),
-        run_id: runner.run_id.clone(),
-        instances,
-    };
+        run_id: run_id.to_string(),
+        instances: instances.to_vec(),
+    }
+}
 
-    let out = args
-        .out
-        .unwrap_or_else(|| runner.run_dir.root.join("summary.json"));
+fn runner_id_from_partial(partial_path: &std::path::Path) -> String {
+    std::fs::read_to_string(partial_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<BenchSummary>(&raw).ok())
+        .map(|s| s.run_id)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()[..4].to_string())
+}
+
+pub fn run_bench(args: BenchArgs) -> Result<BenchSummary> {
+    let problems = load_problems(&args.data)?;
+    let subset = select(&problems, args.n, args.seed);
+    let (topology, aggregator) = args.method.preset();
+
+    let out_path = args.out.clone();
+    let partial_path = out_path
+        .as_deref()
+        .map(|p| p.with_extension("partial.json"))
+        .unwrap_or_else(|| std::env::temp_dir().join("mass_partial.json"));
+
+    // Resume: load already-completed instances and skip those problem IDs.
+    let mut instances: Vec<ScoredInstance> = Vec::new();
+    if args.resume {
+        if let Ok(raw) = std::fs::read_to_string(&partial_path) {
+            if let Ok(prior) = serde_json::from_str::<BenchSummary>(&raw) {
+                eprintln!(
+                    "[mass] resume: loaded {}/{} instances from {}",
+                    prior.instances.len(),
+                    subset.len(),
+                    partial_path.display()
+                );
+                instances = prior.instances;
+            }
+        }
+    }
+    let done_ids: std::collections::HashSet<String> =
+        instances.iter().map(|i| i.task_id.clone()).collect();
+    let remaining: Vec<&Problem> = subset
+        .iter()
+        .filter(|p| !done_ids.contains(&p.id))
+        .collect();
+
+    if remaining.is_empty() {
+        eprintln!("[mass] resume: all {} instances already done", subset.len());
+    } else {
+        eprintln!(
+            "[mass] bench method={} n={} ({} remaining) seed={} topology={:?} backend={} model={:?}",
+            args.method.name(),
+            subset.len(),
+            remaining.len(),
+            args.seed,
+            topology,
+            args.model.backend,
+            args.model.model
+        );
+
+        let mut runner = Runner::setup(RunnerOptions {
+            topology,
+            aggregator,
+            model: args.model.clone(),
+            timeout: args.timeout,
+            max_concurrent: args.max_concurrent,
+            with_grader: true,
+            run_root: None,
+        })?;
+        eprintln!(
+            "[mass] run {} ready; results under {}",
+            runner.run_id,
+            runner.run_dir.root.display()
+        );
+
+        let total = subset.len();
+        let done_so_far = instances.len();
+        for (i, problem) in remaining.iter().enumerate() {
+            let task = TaskInstance {
+                id: problem.id.clone(),
+                question: problem.question.clone(),
+                context: None,
+                tests: None,
+            };
+            let scored = match runner.run_instance(&task) {
+                Ok(InstanceResult {
+                    answer,
+                    llm_calls,
+                    failures,
+                    ..
+                }) => {
+                    let score = match answer.as_deref() {
+                        Some(a) => runner
+                            .grade(&problem.id, a, &problem.solution, &problem.question_type)
+                            .unwrap_or(0.0),
+                        None => 0.0,
+                    };
+                    ScoredInstance {
+                        task_id: problem.id.clone(),
+                        question_type: problem.question_type.clone(),
+                        gold: problem.answer.clone(),
+                        predicted: answer,
+                        score,
+                        llm_calls,
+                        failures,
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[mass] instance {} failed: {err:#}", problem.id);
+                    ScoredInstance {
+                        task_id: problem.id.clone(),
+                        question_type: problem.question_type.clone(),
+                        gold: problem.answer.clone(),
+                        predicted: None,
+                        score: 0.0,
+                        llm_calls: 0,
+                        failures: 0,
+                    }
+                }
+            };
+            eprintln!(
+                "[mass] [{}/{}] {} predicted={:?} score={:.2}",
+                done_so_far + i + 1,
+                total,
+                problem.id,
+                scored.predicted,
+                scored.score
+            );
+            instances.push(scored);
+
+            // Flush partial results after every problem so a crash is resumable.
+            let partial = make_summary(&args, topology.aggregate, &instances, "partial");
+            let _ = mailbox::write_json_atomic(&partial_path, &partial);
+        }
+
+        runner.teardown()?;
+    }
+
+    let summary = make_summary(
+        &args,
+        topology.aggregate,
+        &instances,
+        &runner_id_from_partial(&partial_path),
+    );
+    let out = out_path.unwrap_or_else(|| partial_path.with_extension("json"));
     mailbox::write_json_atomic(&out, &summary)?;
+    let _ = std::fs::remove_file(&partial_path);
     eprintln!(
-        "[mass] {}: {}/{} = {:.1}% (calls={}, failures={}) -> {}",
+        "[mass] {}: mean score {:.3} over {} (calls={}, failures={}) -> {}",
         summary.method,
-        summary.correct,
+        summary.accuracy,
         summary.n,
-        summary.accuracy * 100.0,
         summary.total_llm_calls,
         summary.total_failures,
         out.display()
     );
+    for (t, st) in &summary.by_type {
+        eprintln!("[mass]   {t}: {:.3} (n={})", st.accuracy, st.n);
+    }
 
-    runner.teardown()?;
     Ok(summary)
 }
 
@@ -374,109 +360,60 @@ mod tests {
 
     #[test]
     fn presets_respect_cap_and_shapes() {
-        for method in [
-            Method::Cot,
-            Method::Sc9,
-            Method::Mad,
-            Method::Reflect,
-            Method::Sc9Tuned,
-        ] {
-            let (topology, aggregator, _) = method.preset();
+        for method in [Method::Cot, Method::SelfRefine, Method::Sc5, Method::Debate] {
+            let (topology, aggregator) = method.preset();
             topology.validate().unwrap();
             topology.check_cap(aggregator).unwrap();
         }
-        let (mad, mode, _) = Method::Mad.preset();
-        assert_eq!(mad.llm_calls(mode), 10); // 3x3 + 1, matching the paper
-        let (sc9, mode, _) = Method::Sc9.preset();
-        assert_eq!(sc9.llm_calls(mode), 9);
+        let (debate, mode) = Method::Debate.preset();
+        assert_eq!(debate.llm_calls(mode), 10); // 3x3 + 1, matching the paper
+        let (sc5, mode) = Method::Sc5.preset();
+        assert_eq!(sc5.llm_calls(mode), 6); // 5 predictors + LLM aggregator
+        assert_eq!(mode, AggregatorMode::Llm);
     }
 
     #[test]
-    fn level_filter_keeps_only_that_level() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/math_subset.jsonl");
-        let problems = load_problems(&path).unwrap();
-        let l5: Vec<_> = problems.iter().filter(|p| p.level == 5).cloned().collect();
-        assert!(
-            l5.len() >= 20,
-            "expected >=20 level-5 problems, got {}",
-            l5.len()
-        );
-        // n=20 over the level-5-only set is deterministic (same problems for
-        // every method that passes the same seed).
-        let a = select(&l5, 20, 0);
-        let b = select(&l5, 20, 0);
-        assert_eq!(a.len(), 20);
-        assert!(a.iter().all(|p| p.level == 5));
-        assert_eq!(
-            a.iter().map(|p| &p.id).collect::<Vec<_>>(),
-            b.iter().map(|p| &p.id).collect::<Vec<_>>(),
-        );
-    }
-
-    #[test]
-    fn stratified_balances_levels_and_is_disjoint_across_seeds() {
-        use std::collections::{BTreeMap, HashSet};
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/math_subset.jsonl");
-        let problems = load_problems(&path).unwrap();
-
-        let run1 = select_stratified(&problems, 20, 0);
-        assert_eq!(run1.len(), 20);
-        // 4 problems from each of the 5 levels.
-        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
-        for p in &run1 {
-            *counts.entry(p.level).or_default() += 1;
-        }
-        assert_eq!(counts.len(), 5, "all five levels represented");
-        assert!(counts.values().all(|&c| c == 4), "balanced: {counts:?}");
-
-        // Deterministic: same seed -> same set.
-        let run1b = select_stratified(&problems, 20, 0);
-        assert_eq!(
-            run1.iter().map(|p| &p.id).collect::<Vec<_>>(),
-            run1b.iter().map(|p| &p.id).collect::<Vec<_>>(),
-        );
-
-        // Consecutive seeds (run 1 vs run 2) are disjoint problem sets.
-        let run2 = select_stratified(&problems, 20, 1);
-        let ids1: HashSet<_> = run1.iter().map(|p| &p.id).collect();
-        assert!(
-            run2.iter().all(|p| !ids1.contains(&p.id)),
-            "run 1 and run 2 should share no problems",
-        );
-    }
-
-    #[test]
-    fn aggregate_k_override_sets_width_and_guards_cap() {
-        let (sc9, mode, _) = Method::Sc9.preset();
-        // No override leaves the preset untouched.
-        assert_eq!(apply_aggregate_k(sc9, None, mode).unwrap().aggregate, 9);
-        // SC@5 = sc9 preset narrowed to width 5.
-        let sc5 = apply_aggregate_k(sc9, Some(5), mode).unwrap();
-        assert_eq!(sc5.aggregate, 5);
-        assert_eq!(sc5.llm_calls(mode), 5);
-        // Off-dimension widths are rejected before any spawn.
-        assert!(apply_aggregate_k(sc9, Some(4), mode).is_err());
-        // A width that would blow the 10-call cap is rejected too.
-        let (mass, mmode, _) = Method::Sc9Tuned.preset();
-        assert!(apply_aggregate_k(mass, Some(3), mmode).unwrap().aggregate == 3);
-        let (summ, smode) = (
-            TopologyConfig {
-                summarize: 1,
-                ..Default::default()
-            },
-            AggregatorMode::Rule,
-        );
-        assert!(apply_aggregate_k(summ, Some(9), smode).is_err());
+    fn make_summary_breaks_down_by_type() {
+        let inst = |t: &str, score: f64| ScoredInstance {
+            task_id: "x".into(),
+            question_type: t.into(),
+            gold: "g".into(),
+            predicted: Some("p".into()),
+            score,
+            llm_calls: 1,
+            failures: 0,
+        };
+        let instances = vec![
+            inst("ODE", 0.0),
+            inst("ODE", 0.1),
+            inst("polynomial_roots", 0.8),
+        ];
+        let args = BenchArgs {
+            method: Method::Cot,
+            data: PathBuf::new(),
+            n: 3,
+            seed: 0,
+            max_concurrent: 0,
+            resume: false,
+            model: ModelConfig::default(),
+            timeout: Duration::from_secs(1),
+            out: None,
+        };
+        let s = make_summary(&args, 1, &instances, "test");
+        assert!((s.accuracy - 0.3).abs() < 1e-9); // (0+0.1+0.8)/3
+        assert_eq!(s.by_type["ODE"].n, 2);
+        assert!((s.by_type["ODE"].accuracy - 0.05).abs() < 1e-9);
+        assert!((s.by_type["polynomial_roots"].accuracy - 0.8).abs() < 1e-9);
     }
 
     #[test]
     fn vendored_dataset_loads_and_selects() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/math_subset.jsonl");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/hardmath_subset.jsonl");
         let problems = load_problems(&path).unwrap();
-        assert!(problems.len() >= 100, "expected >=100 vendored problems");
+        assert_eq!(problems.len(), 300);
         for p in &problems {
-            assert!(!p.problem.is_empty());
-            assert!(!p.answer.is_empty());
+            assert!(!p.question.is_empty());
+            assert!(!p.solution.is_empty());
             assert!(!p.id.is_empty());
         }
         let a = select(&problems, 20, 0);
@@ -485,5 +422,18 @@ mod tests {
         assert_eq!(a[0].id, b[0].id); // deterministic
         let c = select(&problems, 20, 7);
         assert_ne!(a[0].id, c[0].id); // seed shifts the slice
+    }
+
+    #[test]
+    fn dataset_balanced_across_types() {
+        use std::collections::BTreeMap;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/hardmath_subset.jsonl");
+        let problems = load_problems(&path).unwrap();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for p in &problems {
+            *counts.entry(p.question_type.clone()).or_default() += 1;
+        }
+        assert_eq!(counts.len(), 6, "six question types: {counts:?}");
+        assert!(counts.values().all(|&c| c == 50), "50 each: {counts:?}");
     }
 }

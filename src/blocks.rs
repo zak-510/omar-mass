@@ -1,8 +1,7 @@
-//! The five topology building blocks.
-//! Each function builds the wave of role calls for one stage. Pure prompt
-//! construction; the runner dispatches them and feeds results back in.
+//! The five topology building blocks. Each function builds one stage's wave of
+//! role calls; the runner dispatches them and feeds results back in.
 
-use crate::prompts::{self, PredictorKind};
+use crate::prompts;
 use crate::protocol::Role;
 
 /// One LLM call: which session (role, slot), which round, rendered prompt.
@@ -40,19 +39,13 @@ pub fn summarize_wave(
 }
 
 /// Aggregate (parallel part): N predictors answer independently.
-pub fn predict_wave(
-    kind: PredictorKind,
-    width: usize,
-    question: &str,
-    summaries: &[Option<String>],
-) -> Vec<CallSpec> {
+pub fn predict_wave(width: usize, question: &str, summaries: &[Option<String>]) -> Vec<CallSpec> {
     (1..=width)
         .map(|slot| CallSpec {
             role: Role::Predictor,
             slot,
             round: 0,
             payload: prompts::predictor(
-                kind,
                 question,
                 summaries.get(slot - 1).and_then(|s| s.as_deref()),
             ),
@@ -155,6 +148,16 @@ pub fn aggregate_call(question: &str, texts: &[String]) -> CallSpec {
     }
 }
 
+/// LLM-judge grading call: score the final answer against the gold solution.
+pub fn judge_call(predicted: &str, solution: &str, question_type: &str) -> CallSpec {
+    CallSpec {
+        role: Role::Grader,
+        slot: 0,
+        round: 0,
+        payload: prompts::judge(predicted, solution, question_type),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,10 +178,18 @@ mod tests {
 
     #[test]
     fn predict_wave_has_one_call_per_chain() {
-        let wave = predict_wave(PredictorKind::Cot, 3, "Q", &[]);
+        let wave = predict_wave(3, "Q", &[]);
         assert_eq!(wave.len(), 3);
         assert_eq!(wave[2].slot, 3);
         assert!(wave.iter().all(|c| c.role == Role::Predictor));
+    }
+
+    #[test]
+    fn judge_call_targets_grader_slot() {
+        let c = judge_call("eps=0.14", "gold", "ODE");
+        assert_eq!(c.role, Role::Grader);
+        assert_eq!(c.slot, 0);
+        assert!(c.payload.contains("eps=0.14"));
     }
 
     #[test]

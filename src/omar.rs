@@ -1,6 +1,5 @@
-//! MCP stdio client for the OMAR server.
-//! Spawns `omar mcp-server` and trades line-delimited JSON-RPC.
-//! Server config comes from OMAR_DIR, OMAR_EA_ID, OMAR_TMUX_SERVER.
+//! MCP stdio client for the OMAR server: spawns `omar mcp-server` and trades
+//! line-delimited JSON-RPC. Config from OMAR_DIR, OMAR_EA_ID, OMAR_TMUX_SERVER.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -9,6 +8,9 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Parent every MASS agent is spawned under: the OMAR engineering agent.
+const PARENT_AGENT: &str = "ea";
 
 pub struct OmarClient {
     child: Child,
@@ -182,11 +184,10 @@ impl OmarClient {
             "project_id": project_id,
             "task": task,
             "workdir": workdir,
-            "parent": "ea",
+            "parent": PARENT_AGENT,
         });
-        // agy model names are display labels with spaces, which OMAR's --model
-        // path rejects. Route agy through the raw command with the label quoted.
-        // OMAR still infers backend=agy from the first token.
+        // agy model labels have spaces that OMAR's --model path rejects; route
+        // agy through the raw command (OMAR infers backend=agy from token 1).
         if backend == "agy" {
             args["command"] = json!(agy_spawn_command(model));
         } else {

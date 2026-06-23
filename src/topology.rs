@@ -1,7 +1,5 @@
-//! Topology configuration, validation, and plan sizing.
-//! A config activates blocks in order [summarize, reflect, debate, aggregate],
-//! with Execute on the predictor. `aggregate` is the number of parallel chains;
-//! the other blocks define one chain.
+//! Topology config, validation, and plan sizing. Blocks activate in order
+//! [summarize, reflect, debate, aggregate] (+execute); `aggregate` = chains.
 
 use crate::protocol::Role;
 use anyhow::{bail, Result};
@@ -245,9 +243,9 @@ mod tests {
 
     #[test]
     fn session_specs_cover_active_roles() {
-        let sc9 = cfg(0, 0, 0, 9, 0).session_specs(AggregatorMode::Rule);
-        assert_eq!(sc9.len(), 9);
-        assert!(sc9.iter().all(|s| s.role == Role::Predictor));
+        let wide = cfg(0, 0, 0, 9, 0).session_specs(AggregatorMode::Rule);
+        assert_eq!(wide.len(), 9);
+        assert!(wide.iter().all(|s| s.role == Role::Predictor));
 
         let mad = cfg(0, 0, 2, 3, 0).session_specs(AggregatorMode::Llm);
         // 3 predictors + 3 debators + 1 aggregator.
