@@ -4,15 +4,29 @@
 const ANSWER_TAG_INSTRUCTION: &str =
     "Show your final answer bracketed between <answer> and </answer> at the end.";
 
+/// Deterministic per-slot strategy hint: keyed by 1-based chain index so
+/// parallel chains diversify without temperature. Slot 1 is neutral, leaving
+/// single-chain methods (cot, self-refine, width=1) byte-for-byte unchanged.
+fn strategy_hint(slot: usize) -> &'static str {
+    match slot {
+        2 => " Prefer a numerical approach: estimate the answer, then verify it.",
+        3 => " Watch the edge cases and cross-check with an alternate method.",
+        4 => " Derive symbolically and simplify carefully before evaluating.",
+        5 => " Reason about the asymptotic/limiting behavior to bound the answer.",
+        _ => "",
+    }
+}
+
 /// Zero-shot CoT predictor. A summary from the Summarize block, when present,
-/// is passed as extra context.
-pub fn predictor(question: &str, summary: Option<&str>) -> String {
+/// is passed as extra context. `slot` selects a deterministic strategy hint.
+pub fn predictor(question: &str, summary: Option<&str>, slot: usize) -> String {
     let context = match summary {
         Some(s) => format!("Context (summarized): {}\n", s),
         None => String::new(),
     };
     format!(
-        "Let's think step by step. {tag}\n\n---\n\nFollow the following format.\n\nQuestion: ${{question}}\nReasoning: Let's think step by step in order to ${{produce the answer}}. We ...\nAnswer: ${{answer}}\n\n---\n\n{context}Question: {question}\nReasoning: Let's think step by step in order to",
+        "Let's think step by step.{hint} {tag}\n\n---\n\nFollow the following format.\n\nQuestion: ${{question}}\nReasoning: Let's think step by step in order to ${{produce the answer}}. We ...\nAnswer: ${{answer}}\n\n---\n\n{context}Question: {question}\nReasoning: Let's think step by step in order to",
+        hint = strategy_hint(slot),
         tag = ANSWER_TAG_INSTRUCTION,
     )
 }
@@ -37,13 +51,15 @@ pub fn refiner(
 }
 
 /// App. D Debator: sees all other agents' solutions, produces an updated answer.
-pub fn debator(question: &str, solutions: &[String]) -> String {
+/// `slot` selects the same deterministic strategy hint as the predictor.
+pub fn debator(question: &str, solutions: &[String], slot: usize) -> String {
     let mut listed = String::new();
     for (i, solution) in solutions.iter().enumerate() {
         listed.push_str(&format!("[Agent {}] {}\n\n", i + 1, solution));
     }
     format!(
-        "These are the solutions to the question from other agents. Examine the solutions from other agents in your rationale, finish by giving an updated answer. Show your final answer bracketed between <answer> and </answer> at the end.\n\n---\n\nFollow the following format.\n\nQuestion: ${{question}}\nSolutions: the solutions to the question from other agents\nReasoning: Let's think step by step in order to ${{Examine the solutions from other agents}}. We ...\nAnswer: The updated answer for the question. Do not repeat Answer:\n\n---\n\nQuestion: {question}\nSolutions:\n{listed}Reasoning: Let's think step by step in order to",
+        "These are the solutions to the question from other agents. Examine the solutions from other agents in your rationale, finish by giving an updated answer.{hint} Keep all comparison of the other agents in your reasoning; the <answer> must be the self-contained final result only, never a reference to another agent by number or label. Show your final answer bracketed between <answer> and </answer> at the end.\n\n---\n\nFollow the following format.\n\nQuestion: ${{question}}\nSolutions: the solutions to the question from other agents\nReasoning: Let's think step by step in order to ${{Examine the solutions from other agents}}. We ...\nAnswer: The updated self-contained answer for the question, with no references to other agents. Do not repeat Answer:\n\n---\n\nQuestion: {question}\nSolutions:\n{listed}Reasoning: Let's think step by step in order to",
+        hint = strategy_hint(slot),
     )
 }
 
@@ -54,14 +70,16 @@ pub fn summarizer(question: &str, context: &str) -> String {
     )
 }
 
-/// LLM aggregator (Multi-Agent Debate baseline; SC uses the rule vote).
+/// LLM aggregator for SC@5 and Multi-Agent Debate. Candidates are labeled so the
+/// judge can compare them, but it must restate the chosen answer in full — naming
+/// a candidate (e.g. "Agent 4") would lose the answer and score 0.
 pub fn aggregator(question: &str, answers: &[String]) -> String {
     let mut listed = String::new();
     for (i, answer) in answers.iter().enumerate() {
-        listed.push_str(&format!("[Agent {}] {}\n\n", i + 1, answer));
+        listed.push_str(&format!("[Candidate {}] {}\n\n", i + 1, answer));
     }
     format!(
-        "These are the final solutions to the question from multiple agents. Judge the solutions and make the final prediction: pick the most consistent and correct answer. Show your final answer bracketed between <answer> and </answer> at the end.\n\nQuestion: {question}\nSolutions:\n{listed}",
+        "Below are candidate final answers to the question. Decide which is most consistent and correct, then output that answer in full as your own. Reproduce the complete answer expression itself; never refer to a candidate by number or label (do not write 'Candidate 2' or 'Agent 4') and do not add a 'consensus' prefix. Show the final answer bracketed between <answer> and </answer> at the end.\n\nQuestion: {question}\nCandidates:\n{listed}",
     )
 }
 
@@ -83,6 +101,28 @@ fn rubric(question_type: &str) -> &'static str {
     }
 }
 
+/// Anonymous label for a batched-grade candidate: 0 -> A, 1 -> B, ...
+pub fn label(i: usize) -> char {
+    (b'A' + i as u8) as char
+}
+
+/// Batched grader: one call scores every candidate against the gold solution
+/// under the same rubric, each judged independently (no cross-answer ranking).
+pub fn judge_batch(answers: &[String], solution: &str, question_type: &str) -> String {
+    let mut listed = String::new();
+    for (i, a) in answers.iter().enumerate() {
+        listed.push_str(&format!("[Answer {}]\n{}\n\n", label(i), a));
+    }
+    let keys: Vec<String> = (0..answers.len())
+        .map(|i| format!("{}: <0-1>", label(i)))
+        .collect();
+    format!(
+        "Score each candidate answer independently against the ground-truth solution using the rubric. Judge each answer ONLY against the ground truth, never relative to the other answers.\n\nGround truth solution: {solution}\n\nRubric:\n{rubric}\n\n{listed}Output every answer's float in [0,1] on one line bracketed between <answer> and </answer>, formatted exactly as: {keys}.",
+        rubric = rubric(question_type),
+        keys = keys.join(", "),
+    )
+}
+
 /// HARDMath LLM-judge prompt: the judge sees the response and the ground-truth
 /// solution, applies the type rubric, and returns a 0-1 float.
 pub fn judge(predicted: &str, solution: &str, question_type: &str) -> String {
@@ -98,7 +138,7 @@ mod tests {
 
     #[test]
     fn predictor_embeds_question_and_tag() {
-        let p = predictor("What is 2+2?", None);
+        let p = predictor("What is 2+2?", None, 1);
         assert!(p.contains("Let's think step by step."));
         assert!(p.contains("Question: What is 2+2?"));
         assert!(p.contains("<answer>"));
@@ -107,8 +147,24 @@ mod tests {
 
     #[test]
     fn predictor_includes_summary_when_present() {
-        let p = predictor("Q", Some("key facts"));
+        let p = predictor("Q", Some("key facts"), 1);
         assert!(p.contains("Context (summarized): key facts"));
+    }
+
+    #[test]
+    fn predictor_slot1_is_neutral_others_perturbed() {
+        // Slot 1 must stay identical so single-chain methods are unchanged.
+        let s1 = predictor("Q", None, 1);
+        assert!(s1.starts_with("Let's think step by step. Show your final answer"));
+        // Slots >1 get a distinct deterministic hint.
+        let s2 = predictor("Q", None, 2);
+        let s3 = predictor("Q", None, 3);
+        assert!(s2.contains("numerical approach"));
+        assert!(s3.contains("edge cases"));
+        assert_ne!(s1, s2);
+        assert_ne!(s2, s3);
+        // Reproducible: same slot yields the same prompt.
+        assert_eq!(s2, predictor("Q", None, 2));
     }
 
     #[test]
@@ -126,10 +182,15 @@ mod tests {
 
     #[test]
     fn debator_lists_all_solutions() {
-        let d = debator("Q", &["sol a".into(), "sol b".into(), "sol c".into()]);
+        let d = debator("Q", &["sol a".into(), "sol b".into(), "sol c".into()], 1);
         assert!(d.contains("[Agent 1] sol a"));
         assert!(d.contains("[Agent 3] sol c"));
         assert!(d.contains("<answer>"));
+        // <answer> must stay a self-contained result, no agent-reference leak.
+        assert!(d.contains("self-contained final result only"));
+        // Slot 1 neutral; slot 2 carries the strategy hint.
+        assert!(!d.contains("numerical approach"));
+        assert!(debator("Q", &["x".into()], 2).contains("numerical approach"));
     }
 
     #[test]
@@ -137,12 +198,25 @@ mod tests {
         let s = summarizer("Q", "long context here");
         assert!(s.contains("Context: long context here"));
         let a = aggregator("Q", &["1".into(), "2".into()]);
-        assert!(a.contains("[Agent 2] 2"));
+        assert!(a.contains("[Candidate 2] 2"));
         assert!(a.contains("<answer>"));
+        assert!(a.contains("never refer to a candidate"));
 
         let e = executor("def add(a,b): return a+b", "assert add(1,2)==3");
         assert!(e.contains("assert add(1,2)==3"));
         assert!(e.contains("Execution result: PASS or FAIL"));
+    }
+
+    #[test]
+    fn judge_batch_anonymizes_and_demands_independent_scores() {
+        let j = judge_batch(&["ans one".into(), "ans two".into()], "gold", "integral");
+        assert!(j.contains("[Answer A]\nans one"));
+        assert!(j.contains("[Answer B]\nans two"));
+        assert!(j.contains("never relative to the other answers"));
+        assert!(j.contains("A: <0-1>, B: <0-1>"));
+        assert!(j.contains("epsilon regimes")); // integral rubric carried
+                                                // No method names leak into the prompt.
+        assert!(!j.to_lowercase().contains("cot") && !j.contains("debate"));
     }
 
     #[test]

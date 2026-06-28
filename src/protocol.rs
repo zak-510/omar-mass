@@ -133,16 +133,109 @@ pub fn parse_answer(text: &str) -> Option<String> {
     extract_last_boxed(text)
 }
 
-/// Parse the judge's 0-1 score from its output, clamped to [0,1]. Reuses the
-/// answer parser (tags, then `\boxed{}`) and reads the first float in it.
+/// If the LLM aggregator answered with a bare candidate reference ("Agent 4",
+/// "Candidate 2:") instead of the answer itself, map it back to that 1-indexed
+/// candidate's answer. Returns None when real answer text follows the number.
+pub fn resolve_agent_reference(answer: &str, candidates: &[String]) -> Option<String> {
+    let rest = strip_prefix_ci(answer.trim(), "agent")
+        .or_else(|| strip_prefix_ci(answer.trim(), "candidate"))?
+        .trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    // Bare reference only: nothing alphanumeric may follow the number.
+    if rest[digits.len()..].chars().any(|c| c.is_alphanumeric()) {
+        return None;
+    }
+    let idx: usize = digits.parse().ok()?;
+    candidates.get(idx.checked_sub(1)?).cloned()
+}
+
+/// Parse per-label grades ("A: 0.5, B: 0.0") from a batched judge reply, aligned
+/// to 0-based label index (A=0). None where a label is missing or unparseable.
+pub fn parse_label_scores(text: &str, n: usize) -> Vec<Option<f64>> {
+    let body = parse_answer(text).unwrap_or_else(|| text.to_string());
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = vec![None; n];
+    for i in 0..chars.len() {
+        let idx = match chars[i] {
+            c if c.is_ascii_uppercase() => (c as u8 - b'A') as usize,
+            _ => continue,
+        };
+        if idx >= n || (i > 0 && chars[i - 1].is_ascii_alphanumeric()) {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < chars.len() && chars[j] == ' ' {
+            j += 1;
+        }
+        if j >= chars.len() || (chars[j] != ':' && chars[j] != '=') {
+            continue;
+        }
+        let rest: String = chars[j + 1..].iter().collect();
+        if let Some(v) = parse_ratio_or_float(&rest) {
+            out[idx] = Some(v.clamp(0.0, 1.0));
+        }
+    }
+    out
+}
+
+/// Parse the judge's 0-1 score, clamped to [0,1]. Strict score contract:
+/// prefer the requested `<answer>`/`\boxed` payload, then a labeled
+/// "grade/score", then a bare leading number. Handles fractions (`1/2` -> 0.5)
+/// and returns None only on a genuine parse failure (so a true 0.0 is kept).
 pub fn parse_score(text: &str) -> Option<f64> {
-    let raw = parse_answer(text)?;
-    let num: String = raw
-        .trim_start_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+    let value = parse_answer(text)
+        .as_deref()
+        .and_then(parse_ratio_or_float)
+        .or_else(|| labeled_score(text))
+        .or_else(|| parse_ratio_or_float(text))?;
+    Some(value.clamp(0.0, 1.0))
+}
+
+/// First numeric token of `s` as a float, supporting an `a/b` fraction so a
+/// grade like `1/2` reads as 0.5 rather than truncating to 1.
+fn parse_ratio_or_float(s: &str) -> Option<f64> {
+    let start = s.find(|c: char| c.is_ascii_digit() || c == '-')?;
+    let num_str: String = s[start..]
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
         .collect();
-    num.parse::<f64>().ok().map(|v| v.clamp(0.0, 1.0))
+    let num: f64 = num_str.parse().ok()?;
+    let rest = s[start + num_str.len()..].trim_start();
+    if let Some(after_slash) = rest.strip_prefix('/') {
+        let den_str: String = after_slash
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if let Ok(den) = den_str.parse::<f64>() {
+            if den != 0.0 {
+                return Some(num / den);
+            }
+        }
+    }
+    Some(num)
+}
+
+/// The number following the last "grade"/"score" keyword, for graders that emit
+/// a bare/labeled grade (e.g. "Grade: 0.5", "The score is 0.5") without tags.
+fn labeled_score(text: &str) -> Option<f64> {
+    let lower = text.to_lowercase();
+    let mut best = None;
+    for kw in ["grade", "score"] {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(kw) {
+            let after = from + rel + kw.len();
+            // get() (vs slicing) can't panic if a multibyte head shifts offsets.
+            if let Some(v) = text.get(after..).and_then(parse_ratio_or_float) {
+                best = Some(v); // last keyword wins (the final verdict)
+            }
+            from = after;
+        }
+    }
+    best
 }
 
 /// Content of the last brace-balanced `\boxed{...}`, if any.
@@ -244,6 +337,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_label_scores_reads_per_label_grades() {
+        let r = parse_label_scores("<answer>A: 0.5, B: 0.0, C: 1</answer>", 3);
+        assert_eq!(r, vec![Some(0.5), Some(0.0), Some(1.0)]);
+        // Tolerates "Answer X:" prefixes and newlines; missing label stays None.
+        let r = parse_label_scores("Answer A = 0.25\nAnswer C = 0.75", 3);
+        assert_eq!(r, vec![Some(0.25), None, Some(0.75)]);
+        // Fractions and clamping.
+        assert_eq!(parse_label_scores("A: 1/2", 1), vec![Some(0.5)]);
+    }
+
+    #[test]
+    fn resolve_agent_reference_recovers_bare_picks_only() {
+        let cands = vec![
+            "x = 1".to_string(),
+            "x = 2".to_string(),
+            "x = 3".to_string(),
+        ];
+        // Bare references (the bug) map back to the chosen candidate.
+        assert_eq!(
+            resolve_agent_reference("Agent 3", &cands).as_deref(),
+            Some("x = 3")
+        );
+        assert_eq!(
+            resolve_agent_reference("agent 1", &cands).as_deref(),
+            Some("x = 1")
+        );
+        assert_eq!(
+            resolve_agent_reference("Candidate 2:", &cands).as_deref(),
+            Some("x = 2")
+        );
+        // Real answer text after the number is left untouched.
+        assert_eq!(resolve_agent_reference("Agent 2: x = 2", &cands), None);
+        assert_eq!(resolve_agent_reference("x = 2", &cands), None);
+        // Out-of-range or non-reference -> no recovery.
+        assert_eq!(resolve_agent_reference("Agent 9", &cands), None);
+    }
+
+    #[test]
     fn parse_answer_handles_multiline_and_case() {
         let text = "Reasoning...\n<ANSWER>\n\\frac{1}{2}\n</ANSWER>";
         assert_eq!(parse_answer(text).as_deref(), Some("\\frac{1}{2}"));
@@ -332,6 +463,13 @@ mod tests {
         assert_eq!(parse_score("score is \\boxed{0}"), Some(0.0));
         assert_eq!(parse_score("\\boxed{1.5}"), Some(1.0));
         assert_eq!(parse_score("no score here"), None);
+        // Bare/labeled grades with no wrapper must still parse (regression C2).
+        assert_eq!(parse_score("Grade: 0.5"), Some(0.5));
+        assert_eq!(parse_score("The score is 0.5"), Some(0.5));
+        assert_eq!(parse_score("0.0"), Some(0.0)); // genuine 0, not a failure
+                                                   // Fractions must not truncate to the numerator.
+        assert_eq!(parse_score("<answer>1/2</answer>"), Some(0.5));
+        assert_eq!(parse_score("Grade: 1/4"), Some(0.25));
     }
 
     #[test]

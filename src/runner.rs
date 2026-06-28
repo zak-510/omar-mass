@@ -80,6 +80,10 @@ pub struct RunnerOptions {
     /// Spawn a dedicated grader agent for the LLM-judge scoring pass (bench
     /// only; `run`/`demo-block` leave it off to skip an unused agent).
     pub with_grader: bool,
+    /// Respawn the whole pool before each problem for true statelessness
+    /// (default). False reuses the warm pool (`--no-reset`): ~2x fewer Haiku
+    /// turns, but a reused CLI session carries prior problems' context forward.
+    pub reset_each_problem: bool,
     /// Override the run-dir root (default $OMAR_DIR or $HOME/.omar, + mass/runs).
     pub run_root: Option<PathBuf>,
 }
@@ -135,6 +139,19 @@ fn cap_sessions(full: Vec<SessionSpec>, max_concurrent: usize) -> Vec<SessionSpe
             .filter(|s| s.slot == 0 || s.slot <= max_concurrent)
             .collect()
     }
+}
+
+/// Remap a sub-wave onto the resident pool's physical slots 1..=len, so a
+/// non-contiguous batch never targets a high slot that was never spawned.
+fn remap_to_pool(chunk: &[CallSpec]) -> Vec<CallSpec> {
+    chunk
+        .iter()
+        .enumerate()
+        .map(|(i, c)| CallSpec {
+            slot: i + 1,
+            ..c.clone()
+        })
+        .collect()
 }
 
 fn sanitize_id(raw: &str) -> String {
@@ -322,39 +339,39 @@ impl Runner {
         SessionSpec { role, slot }.short_name(&self.run_id)
     }
 
-    /// Dispatch a wave honoring max_concurrent: a wave that fits runs in one
-    /// parallel batch, a wider one in sequential batches. Replies stay in order.
+    /// Dispatch a wave honoring max_concurrent. Unlimited (k==0) sends the wave
+    /// as-is. Otherwise every batch is remapped onto the resident pool's slots
+    /// 1..=k -- even a single sub-wave whose length fits but whose slots are
+    /// non-contiguous (else it would target never-spawned high-slot agents).
     fn dispatch(
         &mut self,
         task_id: &str,
         wave: &[CallSpec],
         records: &mut Vec<CallRecord>,
-    ) -> Vec<Option<String>> {
+    ) -> Result<Vec<Option<String>>> {
         let k = self.opts.max_concurrent;
-        if k == 0 || wave.len() <= k {
-            return self.dispatch_batch(task_id, wave, records);
+        if k == 0 {
+            return Ok(self.dispatch_batch(task_id, wave, records));
         }
         let mut results: Vec<Option<String>> = Vec::with_capacity(wave.len());
         for (b, chunk) in wave.chunks(k).enumerate() {
             if b > 0 {
-                // Fresh context for the next independent batch of samples.
-                if let Err(err) = self.reset_agents() {
-                    eprintln!("[mass] batch reset failed (continuing): {err:#}");
-                }
+                // Fresh context for the next independent batch; abort on a
+                // failed reset rather than sending to dead agents (C7).
+                self.reset_agents()
+                    .context("batch reset between sub-waves failed")?;
             }
-            // Map this batch onto the pool's slots 1..=k.
-            let remapped: Vec<CallSpec> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, c)| CallSpec {
-                    slot: i + 1,
-                    ..c.clone()
-                })
-                .collect();
+            let remapped = remap_to_pool(chunk);
+            let rec_start = records.len();
             let mut batch = self.dispatch_batch(task_id, &remapped, records);
+            // Persist the true chain slot, not the remapped 1..=k, in the audit
+            // trail so CallRecord provenance survives batching (M1).
+            for (rec, c) in records[rec_start..].iter_mut().zip(chunk) {
+                rec.slot = c.slot;
+            }
             results.append(&mut batch);
         }
-        results
+        Ok(results)
     }
 
     /// Run one wave in parallel: write all envelopes, notify all agents, then
@@ -459,8 +476,9 @@ impl Runner {
     /// persisted under <run_dir>/results/<task_id>.json.
     pub fn run_instance(&mut self, task: &TaskInstance) -> Result<InstanceResult> {
         // Reset before each problem so every instance starts from a fresh
-        // charter with no carried-over context (true statelessness).
-        if !self.fresh {
+        // charter with no carried-over context (true statelessness). Skipped
+        // under --no-reset, which reuses the warm pool for speed.
+        if !self.fresh && self.opts.reset_each_problem {
             self.reset_agents()
                 .with_context(|| format!("Failed to reset agents before task {}", task.id))?;
         }
@@ -477,7 +495,7 @@ impl Runner {
             if let Some(context) = &task.context {
                 for round in 0..cfg.summarize {
                     let wave = blocks::summarize_wave(width, round, &question, context, &summaries);
-                    let replies = self.dispatch(&task.id, &wave, &mut records);
+                    let replies = self.dispatch(&task.id, &wave, &mut records)?;
                     for (call, reply) in wave.iter().zip(replies) {
                         if let Some(content) = reply {
                             summaries[call.slot - 1] = Some(content);
@@ -489,7 +507,7 @@ impl Runner {
 
         // -- Predict (the parallel part of Aggregate) ---------------------
         let wave = blocks::predict_wave(width, &question, &summaries);
-        let replies = self.dispatch(&task.id, &wave, &mut records);
+        let replies = self.dispatch(&task.id, &wave, &mut records)?;
         let mut texts: Vec<String> = vec![String::new(); width];
         let mut answers: Vec<String> = vec![String::new(); width];
         let mut alive: Vec<bool> = vec![false; width];
@@ -509,7 +527,7 @@ impl Runner {
         if cfg.execute > 0 {
             if let Some(tests) = &task.tests {
                 let wave = blocks::execute_wave(&answers, &alive, tests);
-                let replies = self.dispatch(&task.id, &wave, &mut records);
+                let replies = self.dispatch(&task.id, &wave, &mut records)?;
                 for (call, reply) in wave.iter().zip(replies) {
                     if let Some(content) = reply {
                         let idx = call.slot - 1;
@@ -526,7 +544,7 @@ impl Runner {
                 break;
             }
             let wave = blocks::reflect_wave(round, &question, &texts, &reflecting);
-            let replies = self.dispatch(&task.id, &wave, &mut records);
+            let replies = self.dispatch(&task.id, &wave, &mut records)?;
             let mut reflections: Vec<Option<protocol::Reflection>> = vec![None; width];
             for (call, reply) in wave.iter().zip(replies) {
                 let idx = call.slot - 1;
@@ -546,7 +564,7 @@ impl Runner {
             if wave.is_empty() {
                 break;
             }
-            let replies = self.dispatch(&task.id, &wave, &mut records);
+            let replies = self.dispatch(&task.id, &wave, &mut records)?;
             for (call, reply) in wave.iter().zip(replies) {
                 if let Some(content) = reply {
                     let idx = call.slot - 1;
@@ -560,8 +578,9 @@ impl Runner {
 
         // -- Debate (fully connected rounds across chains) -----------------
         for round in 0..cfg.debate {
+            // Send each live chain's full reasoning transcript to the debators.
             let wave = blocks::debate_wave(round, &question, &texts, &alive);
-            let replies = self.dispatch(&task.id, &wave, &mut records);
+            let replies = self.dispatch(&task.id, &wave, &mut records)?;
             for (call, reply) in wave.iter().zip(replies) {
                 if let Some(content) = reply {
                     let idx = call.slot - 1;
@@ -583,17 +602,14 @@ impl Runner {
         let final_answer = match self.opts.aggregator {
             AggregatorMode::Rule => math::majority_vote(&live_answers),
             AggregatorMode::Llm => {
-                let live_texts: Vec<String> = texts
-                    .iter()
-                    .zip(&alive)
-                    .filter(|(_, &ok)| ok)
-                    .map(|(t, _)| t.clone())
-                    .collect();
-                let call = blocks::aggregate_call(&question, &live_texts);
-                let replies = self.dispatch(&task.id, &[call], &mut records);
+                // Aggregate over the parsed answers, not full transcripts.
+                let call = blocks::aggregate_call(&question, &live_answers);
+                let replies = self.dispatch(&task.id, &[call], &mut records)?;
                 replies[0]
                     .as_deref()
                     .and_then(protocol::parse_answer)
+                    // Recover a bare "Agent 4" reference into that candidate's answer.
+                    .map(|a| protocol::resolve_agent_reference(&a, &live_answers).unwrap_or(a))
                     // Fall back to the rule vote if the LLM aggregator fails.
                     .or_else(|| math::majority_vote(&live_answers))
             }
@@ -621,8 +637,28 @@ impl Runner {
     ) -> Option<f64> {
         let call = blocks::judge_call(predicted, solution, question_type);
         let mut records = Vec::new();
-        let replies = self.dispatch(task_id, &[call], &mut records);
+        let replies = self.dispatch(task_id, &[call], &mut records).ok()?;
         replies[0].as_deref().and_then(protocol::parse_score)
+    }
+
+    /// Batched LLM-judge: score every candidate answer in one grader call.
+    /// Scores align to `answers` order; None where the grader gave no value.
+    pub fn grade_batch(
+        &mut self,
+        task_id: &str,
+        answers: &[String],
+        solution: &str,
+        question_type: &str,
+    ) -> Vec<Option<f64>> {
+        let call = blocks::judge_batch_call(answers, solution, question_type);
+        let mut records = Vec::new();
+        match self.dispatch(task_id, &[call], &mut records) {
+            Ok(replies) => replies[0]
+                .as_deref()
+                .map(|r| protocol::parse_label_scores(r, answers.len()))
+                .unwrap_or_else(|| vec![None; answers.len()]),
+            Err(_) => vec![None; answers.len()],
+        }
     }
 
     /// Kill every agent of this run and complete the project. Idempotent;
@@ -718,6 +754,31 @@ mod tests {
         assert!(capped
             .iter()
             .any(|s| s.role == Role::Aggregator && s.slot == 0));
+    }
+
+    #[test]
+    fn remap_to_pool_assigns_contiguous_physical_slots() {
+        use crate::blocks::CallSpec;
+        // A non-contiguous sub-wave (slots 1,3) under a cap must map onto the
+        // resident pool's slots 1,2 -- else slot 3 hits a never-spawned agent.
+        let chunk = vec![
+            CallSpec {
+                role: Role::Debator,
+                slot: 1,
+                round: 0,
+                payload: "a".into(),
+            },
+            CallSpec {
+                role: Role::Debator,
+                slot: 3,
+                round: 0,
+                payload: "b".into(),
+            },
+        ];
+        let remapped = remap_to_pool(&chunk);
+        assert_eq!(remapped[0].slot, 1);
+        assert_eq!(remapped[1].slot, 2);
+        assert_eq!(remapped[1].payload, "b"); // payload/identity preserved
     }
 
     #[test]

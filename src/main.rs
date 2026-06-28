@@ -3,6 +3,7 @@
 
 mod bench;
 mod blocks;
+mod grade;
 mod mailbox;
 mod math;
 mod omar;
@@ -99,7 +100,40 @@ enum Command {
         /// skip already-completed problem IDs, and merge new results in.
         #[arg(long)]
         resume: bool,
+        /// Reuse the warm agent pool across problems instead of respawning
+        /// before each one: ~2x fewer Haiku turns, but trades per-problem
+        /// isolation (a reused session carries prior context forward).
+        #[arg(long)]
+        no_reset: bool,
+        /// Skip inline grading: save predictions only, to be scored later by the
+        /// batched `grade` pass.
+        #[arg(long)]
+        no_grade: bool,
         /// Per-wave reply timeout in seconds.
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+    },
+    /// Batch-grade saved predictions: one blind, shuffled judge call per problem
+    /// scores every method against the gold (paired evaluation).
+    Grade {
+        /// Methods to grade together (must have <method>.seed<seed>.json in --dir).
+        #[arg(long, value_enum, value_delimiter = ',', default_values = ["cot", "self-refine", "sc5", "debate"])]
+        methods: Vec<bench::Method>,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Directory holding the per-method prediction files.
+        #[arg(long)]
+        dir: PathBuf,
+        /// HARDMath JSONL dataset (default: vendored subset).
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// Backend to spawn the grader with.
+        #[arg(long, default_value = "claude")]
+        backend: String,
+        /// Grader model: defaults to Sonnet for stronger instruction-following
+        /// (the solvers under test stay on whatever they ran with).
+        #[arg(long, default_value = "claude-sonnet-4-6")]
+        model: Option<String>,
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
     },
@@ -187,12 +221,18 @@ fn main() -> Result<()> {
             seed,
             max_concurrent,
             resume,
+            no_reset,
+            no_grade,
             data,
             out,
             model,
             timeout_secs,
         } => {
             let data = data.unwrap_or_else(default_dataset);
+            // With --out the full summary is already persisted to that file; only
+            // echo the JSON to stdout when there's no out file to read it from,
+            // so resumable runs don't flood the log with placeholder score:0.0.
+            let echo_json = out.is_none();
             let summary = bench::run_bench(bench::BenchArgs {
                 method,
                 data,
@@ -200,11 +240,35 @@ fn main() -> Result<()> {
                 seed,
                 max_concurrent,
                 resume,
+                reset_each_problem: !no_reset,
+                grade: !no_grade,
                 model: model.to_config(),
                 timeout: Duration::from_secs(timeout_secs),
                 out,
             })?;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if echo_json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            }
+            Ok(())
+        }
+        Command::Grade {
+            methods,
+            seed,
+            dir,
+            data,
+            backend,
+            model,
+            timeout_secs,
+        } => {
+            let data = data.unwrap_or_else(default_dataset);
+            grade::run_grade(grade::GradeArgs {
+                seed,
+                data,
+                methods,
+                dir,
+                model: ModelConfig { backend, model },
+                timeout: Duration::from_secs(timeout_secs),
+            })?;
             Ok(())
         }
         Command::DemoBlock {
@@ -243,6 +307,7 @@ fn run_once(
         timeout,
         max_concurrent,
         with_grader: false,
+        reset_each_problem: true,
         run_root: None,
     })?;
     eprintln!(
@@ -358,4 +423,24 @@ fn teardown(run: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bench_no_reset_flag_parses() {
+        let on = Cli::parse_from(["omar-mass", "bench", "--method", "cot", "--no-reset"]);
+        match on.command {
+            Command::Bench { no_reset, .. } => assert!(no_reset),
+            _ => panic!("expected bench"),
+        }
+        // Default keeps the per-problem respawn (statelessness) on.
+        let off = Cli::parse_from(["omar-mass", "bench", "--method", "cot"]);
+        match off.command {
+            Command::Bench { no_reset, .. } => assert!(!no_reset),
+            _ => panic!("expected bench"),
+        }
+    }
 }

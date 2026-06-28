@@ -22,6 +22,12 @@ pub struct OmarClient {
 /// Launch command for the agy backend (skips permission prompts).
 const AGY_BASE_COMMAND: &str = "agy --dangerously-skip-permissions";
 
+/// True when a parsed JSON-RPC line is the response to `id` (a notification
+/// has no id; another request's reply has a different one).
+fn is_response_for(value: &Value, id: u64) -> bool {
+    value.get("id").and_then(Value::as_u64) == Some(id)
+}
+
 /// Single-quote a value so spaces survive the shell agy runs under.
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -96,30 +102,38 @@ impl OmarClient {
             .context("Failed to write MCP request")?;
         self.stdin.flush().context("Failed to flush MCP stdin")?;
 
-        let mut buf = String::new();
-        let n = self
-            .stdout
-            .read_line(&mut buf)
-            .context("Failed to read MCP response")?;
-        if n == 0 {
-            return Err(anyhow!("MCP server closed stdout unexpectedly"));
+        // Read until our response id arrives, skipping server notifications and
+        // any non-JSON log lines (a single read_line would desync on those).
+        loop {
+            let mut buf = String::new();
+            let n = self
+                .stdout
+                .read_line(&mut buf)
+                .context("Failed to read MCP response")?;
+            if n == 0 {
+                return Err(anyhow!("MCP server closed stdout unexpectedly"));
+            }
+            let line = buf.trim();
+            let resp: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue, // not JSON-RPC (log/progress line); skip
+            };
+            if !is_response_for(&resp, id) {
+                continue; // notification or another request's reply; skip
+            }
+            if let Some(err) = resp.get("error") {
+                return Err(anyhow!(
+                    "MCP server error: {}",
+                    err.get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ));
+            }
+            return resp
+                .get("result")
+                .cloned()
+                .ok_or_else(|| anyhow!("MCP response missing 'result'"));
         }
-        let resp: Value = serde_json::from_str(buf.trim())
-            .with_context(|| format!("Invalid JSON in MCP response: {}", buf.trim()))?;
-        if resp.get("id").and_then(Value::as_u64) != Some(id) {
-            return Err(anyhow!("MCP response id mismatch"));
-        }
-        if let Some(err) = resp.get("error") {
-            return Err(anyhow!(
-                "MCP server error: {}",
-                err.get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-            ));
-        }
-        resp.get("result")
-            .cloned()
-            .ok_or_else(|| anyhow!("MCP response missing 'result'"))
     }
 
     /// Call a tool; returns `structuredContent` on success.
@@ -287,5 +301,14 @@ mod tests {
     #[test]
     fn shell_single_quote_escapes_embedded_quote() {
         assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn is_response_for_matches_only_same_id() {
+        use serde_json::json;
+        assert!(is_response_for(&json!({"id": 3, "result": {}}), 3));
+        // Different id (another reply) and notifications (no id) are skipped.
+        assert!(!is_response_for(&json!({"id": 2, "result": {}}), 3));
+        assert!(!is_response_for(&json!({"method": "progress"}), 3));
     }
 }

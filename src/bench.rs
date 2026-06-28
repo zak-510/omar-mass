@@ -94,12 +94,41 @@ pub fn load_problems(path: &Path) -> Result<Vec<Problem>> {
     Ok(problems)
 }
 
-/// Deterministic subset selection: rotate by seed, take n.
-pub fn select<T: Clone>(items: &[T], n: usize, seed: u64) -> Vec<T> {
-    let len = items.len();
-    let n = n.min(len);
-    let start = (seed as usize) % len;
-    (0..n).map(|i| items[(start + i) % len].clone()).collect()
+/// Round-robin across question_types so any n spans all types; seed rotates
+/// within each type, and select_stratified(n) ⊆ select_stratified(n+1).
+pub fn select_stratified(problems: &[Problem], n: usize, seed: u64) -> Vec<Problem> {
+    let n = n.min(problems.len());
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, p) in problems.iter().enumerate() {
+        groups.entry(p.question_type.clone()).or_default().push(i);
+    }
+    let cols: Vec<Vec<usize>> = groups
+        .into_values()
+        .map(|idxs| {
+            let len = idxs.len();
+            let start = if len == 0 { 0 } else { (seed as usize) % len };
+            (0..len).map(|k| idxs[(start + k) % len]).collect()
+        })
+        .collect();
+    let mut out = Vec::with_capacity(n);
+    let mut depth = 0;
+    while out.len() < n {
+        let mut progressed = false;
+        for col in &cols {
+            if depth < col.len() {
+                out.push(problems[col[depth]].clone());
+                progressed = true;
+                if out.len() == n {
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+        depth += 1;
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +179,12 @@ pub struct BenchArgs {
     pub max_concurrent: usize,
     /// Resume a previous run: load the partial file and skip done problems.
     pub resume: bool,
+    /// Respawn the pool before each problem (default). False (`--no-reset`)
+    /// reuses the warm pool: faster, but trades per-problem isolation.
+    pub reset_each_problem: bool,
+    /// Grade inline (default). False (`--no-grade`) saves predictions only, to
+    /// be scored later by the batched `grade` pass.
+    pub grade: bool,
     pub model: ModelConfig,
     pub timeout: Duration,
     pub out: Option<PathBuf>,
@@ -204,9 +239,21 @@ fn runner_id_from_partial(partial_path: &std::path::Path) -> String {
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()[..4].to_string())
 }
 
+/// Instances worth keeping across a resume: only those with a usable prediction.
+/// A null/empty prediction (e.g. an empty model reply when usage runs out) is a
+/// failed solve, not a completed one — drop it so --resume retries it instead of
+/// poisoning the grade gate, which never scores a problem until every method has
+/// produced an answer for it.
+fn keep_for_resume(instances: Vec<ScoredInstance>) -> Vec<ScoredInstance> {
+    instances
+        .into_iter()
+        .filter(|i| i.predicted.as_deref().is_some_and(|p| !p.trim().is_empty()))
+        .collect()
+}
+
 pub fn run_bench(args: BenchArgs) -> Result<BenchSummary> {
     let problems = load_problems(&args.data)?;
-    let subset = select(&problems, args.n, args.seed);
+    let subset = select_stratified(&problems, args.n, args.seed);
     let (topology, aggregator) = args.method.preset();
 
     let out_path = args.out.clone();
@@ -214,20 +261,29 @@ pub fn run_bench(args: BenchArgs) -> Result<BenchSummary> {
         .as_deref()
         .map(|p| p.with_extension("partial.json"))
         .unwrap_or_else(|| std::env::temp_dir().join("mass_partial.json"));
+    let final_path = out_path
+        .clone()
+        .unwrap_or_else(|| partial_path.with_extension("json"));
 
-    // Resume: load already-completed instances and skip those problem IDs.
+    // Resume from whichever checkpoint has more instances: the partial (crashed
+    // mid-run) or a completed final-out from a smaller n (growing n via --resume).
     let mut instances: Vec<ScoredInstance> = Vec::new();
     if args.resume {
-        if let Ok(raw) = std::fs::read_to_string(&partial_path) {
-            if let Ok(prior) = serde_json::from_str::<BenchSummary>(&raw) {
-                eprintln!(
-                    "[mass] resume: loaded {}/{} instances from {}",
-                    prior.instances.len(),
-                    subset.len(),
-                    partial_path.display()
-                );
-                instances = prior.instances;
-            }
+        let prior = [partial_path.as_path(), final_path.as_path()]
+            .into_iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .filter_map(|raw| serde_json::from_str::<BenchSummary>(&raw).ok())
+            .max_by_key(|s| s.instances.len());
+        if let Some(prior) = prior {
+            let loaded = prior.instances.len();
+            instances = keep_for_resume(prior.instances);
+            let dropped = loaded - instances.len();
+            eprintln!(
+                "[mass] resume: loaded {}/{} instances ({} null-prediction dropped to retry)",
+                instances.len(),
+                subset.len(),
+                dropped,
+            );
         }
     }
     let done_ids: std::collections::HashSet<String> =
@@ -258,6 +314,7 @@ pub fn run_bench(args: BenchArgs) -> Result<BenchSummary> {
             timeout: args.timeout,
             max_concurrent: args.max_concurrent,
             with_grader: true,
+            reset_each_problem: args.reset_each_problem,
             run_root: None,
         })?;
         eprintln!(
@@ -282,10 +339,27 @@ pub fn run_bench(args: BenchArgs) -> Result<BenchSummary> {
                     failures,
                     ..
                 }) => {
+                    // An empty/whitespace reply is a failed solve, not an answer.
+                    let answer = answer.filter(|a| !a.trim().is_empty());
                     let score = match answer.as_deref() {
-                        Some(a) => runner
-                            .grade(&problem.id, a, &problem.solution, &problem.question_type)
-                            .unwrap_or(0.0),
+                        _ if !args.grade => 0.0,
+                        Some(a) => match runner.grade(
+                            &problem.id,
+                            a,
+                            &problem.solution,
+                            &problem.question_type,
+                        ) {
+                            Some(s) => s,
+                            // Surface a grader parse failure instead of burying a
+                            // possibly-correct answer as a silent 0.0 (C2).
+                            None => {
+                                eprintln!(
+                                    "[mass] WARN grader produced no parseable score for {}; recording 0.0",
+                                    problem.id
+                                );
+                                0.0
+                            }
+                        },
                         None => 0.0,
                     };
                     ScoredInstance {
@@ -311,13 +385,20 @@ pub fn run_bench(args: BenchArgs) -> Result<BenchSummary> {
                     }
                 }
             };
+            // Under --no-grade the score is a placeholder 0.0; show "ungraded"
+            // rather than a fake 0.00 that reads as a wrong answer.
+            let score_str = if args.grade {
+                format!("score={:.2}", scored.score)
+            } else {
+                "ungraded (batched grade pass scores later)".to_string()
+            };
             eprintln!(
-                "[mass] [{}/{}] {} predicted={:?} score={:.2}",
+                "[mass] [{}/{}] {} predicted={:?} {}",
                 done_so_far + i + 1,
                 total,
                 problem.id,
-                scored.predicted,
-                scored.score
+                scored.predicted.is_some(),
+                score_str,
             );
             instances.push(scored);
 
@@ -335,20 +416,36 @@ pub fn run_bench(args: BenchArgs) -> Result<BenchSummary> {
         &instances,
         &runner_id_from_partial(&partial_path),
     );
-    let out = out_path.unwrap_or_else(|| partial_path.with_extension("json"));
+    let out = final_path;
     mailbox::write_json_atomic(&out, &summary)?;
     let _ = std::fs::remove_file(&partial_path);
-    eprintln!(
-        "[mass] {}: mean score {:.3} over {} (calls={}, failures={}) -> {}",
-        summary.method,
-        summary.accuracy,
-        summary.n,
-        summary.total_llm_calls,
-        summary.total_failures,
-        out.display()
-    );
-    for (t, st) in &summary.by_type {
-        eprintln!("[mass]   {t}: {:.3} (n={})", st.accuracy, st.n);
+    // Under --no-grade the scores are placeholder 0.0 (the batched `grade` pass
+    // scores later); report prediction counts, not a misleading "mean score 0.000".
+    if args.grade {
+        eprintln!(
+            "[mass] {}: mean score {:.3} over {} (calls={}, failures={}) -> {}",
+            summary.method,
+            summary.accuracy,
+            summary.n,
+            summary.total_llm_calls,
+            summary.total_failures,
+            out.display()
+        );
+        for (t, st) in &summary.by_type {
+            eprintln!("[mass]   {t}: {:.3} (n={})", st.accuracy, st.n);
+        }
+    } else {
+        eprintln!(
+            "[mass] {}: {} predictions saved, ungraded (calls={}, failures={}) -> {}",
+            summary.method,
+            summary.n,
+            summary.total_llm_calls,
+            summary.total_failures,
+            out.display()
+        );
+        for (t, st) in &summary.by_type {
+            eprintln!("[mass]   {t}: n={}", st.n);
+        }
     }
 
     Ok(summary)
@@ -370,6 +467,26 @@ mod tests {
         let (sc5, mode) = Method::Sc5.preset();
         assert_eq!(sc5.llm_calls(mode), 6); // 5 predictors + LLM aggregator
         assert_eq!(mode, AggregatorMode::Llm);
+    }
+
+    #[test]
+    fn keep_for_resume_drops_null_and_empty_predictions() {
+        let mk = |id: &str, pred: Option<&str>| ScoredInstance {
+            task_id: id.into(),
+            question_type: "ODE".into(),
+            gold: "g".into(),
+            predicted: pred.map(str::to_string),
+            score: 0.0,
+            llm_calls: 1,
+            failures: 0,
+        };
+        let kept = keep_for_resume(vec![
+            mk("solved", Some("the answer")),
+            mk("null", None),        // empty model reply on usage cutoff
+            mk("blank", Some("  ")), // whitespace-only
+        ]);
+        let ids: Vec<_> = kept.iter().map(|i| i.task_id.as_str()).collect();
+        assert_eq!(ids, vec!["solved"]); // null/blank dropped so --resume retries them
     }
 
     #[test]
@@ -395,6 +512,8 @@ mod tests {
             seed: 0,
             max_concurrent: 0,
             resume: false,
+            reset_each_problem: true,
+            grade: true,
             model: ModelConfig::default(),
             timeout: Duration::from_secs(1),
             out: None,
@@ -416,12 +535,36 @@ mod tests {
             assert!(!p.solution.is_empty());
             assert!(!p.id.is_empty());
         }
-        let a = select(&problems, 20, 0);
-        let b = select(&problems, 20, 0);
-        assert_eq!(a.len(), 20);
-        assert_eq!(a[0].id, b[0].id); // deterministic
-        let c = select(&problems, 20, 7);
-        assert_ne!(a[0].id, c[0].id); // seed shifts the slice
+    }
+
+    #[test]
+    fn stratified_selection_spans_all_types_and_is_prefix_stable() {
+        use std::collections::BTreeMap;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/hardmath_subset.jsonl");
+        let problems = load_problems(&path).unwrap();
+
+        let s100 = select_stratified(&problems, 100, 0);
+        assert_eq!(s100.len(), 100);
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for p in &s100 {
+            *counts.entry(p.question_type.clone()).or_default() += 1;
+        }
+        assert_eq!(counts.len(), 6, "all six types present: {counts:?}");
+        assert!(
+            counts.values().all(|&c| (16..=17).contains(&c)),
+            "even split 16-17 each: {counts:?}"
+        );
+
+        // Prefix-stable: the n=50 ids are a subset of the n=100 ids (same seed),
+        // so growing n under --resume never re-runs an earlier problem.
+        let ids100: std::collections::HashSet<_> = s100.iter().map(|p| &p.id).collect();
+        for p in select_stratified(&problems, 50, 0) {
+            assert!(ids100.contains(&p.id));
+        }
+
+        // Same seed deterministic; a different seed shifts the slice.
+        assert_eq!(s100[0].id, select_stratified(&problems, 100, 0)[0].id);
+        assert_ne!(s100[0].id, select_stratified(&problems, 100, 7)[0].id);
     }
 
     #[test]

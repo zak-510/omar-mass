@@ -45,9 +45,11 @@ pub fn predict_wave(width: usize, question: &str, summaries: &[Option<String>]) 
             role: Role::Predictor,
             slot,
             round: 0,
+            // Slot carries the deterministic per-chain strategy hint for diversity.
             payload: prompts::predictor(
                 question,
                 summaries.get(slot - 1).and_then(|s| s.as_deref()),
+                slot,
             ),
         })
         .collect()
@@ -111,8 +113,8 @@ pub fn refine_wave(
         .collect()
 }
 
-/// Debate: one fully connected round. Every live chain sees all live
-/// chains' current solutions and produces an updated answer.
+/// Debate: one fully connected round. Every live chain sees all live chains'
+/// full reasoning transcripts and updates its own answer.
 pub fn debate_wave(
     round: usize,
     question: &str,
@@ -133,7 +135,8 @@ pub fn debate_wave(
             role: Role::Debator,
             slot: i + 1,
             round,
-            payload: prompts::debator(question, &solutions),
+            // Per-slot strategy hint keyed by chain index for deterministic diversity.
+            payload: prompts::debator(question, &solutions, i + 1),
         })
         .collect()
 }
@@ -155,6 +158,16 @@ pub fn judge_call(predicted: &str, solution: &str, question_type: &str) -> CallS
         slot: 0,
         round: 0,
         payload: prompts::judge(predicted, solution, question_type),
+    }
+}
+
+/// Batched judge call: score all candidate answers in one grader turn.
+pub fn judge_batch_call(answers: &[String], solution: &str, question_type: &str) -> CallSpec {
+    CallSpec {
+        role: Role::Grader,
+        slot: 0,
+        round: 0,
+        payload: prompts::judge_batch(answers, solution, question_type),
     }
 }
 
