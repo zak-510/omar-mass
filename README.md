@@ -35,7 +35,7 @@ Each method is capped at 10 agent calls, the same limit the paper uses (the grad
 
 ## Grading
 
-Answers are scored by an LLM judge (arXiv:2410.09988), not a normalizer. One grader call per problem sees the predicted answer plus the ground-truth solution and a per-type rubric, and returns a 0-1 score. Accuracy is the mean score (partial credit). Because the judge has the gold solution, Haiku is a strong enough grader.
+One LLM judge scores the answers, not a normalizer. The `grade` pass makes a single blind, shuffled call per problem that scores every method together against the ground truth, so the same answer can't get different scores across methods. Returns a 0-1 score; accuracy is the mean (partial credit). Runs on Sonnet; solvers stay on their own model.
 
 ## Notes
 
