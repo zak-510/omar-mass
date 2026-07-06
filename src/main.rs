@@ -4,6 +4,7 @@
 mod bench;
 mod blocks;
 mod grade;
+mod graph;
 mod mailbox;
 mod math;
 mod omar;
@@ -14,6 +15,7 @@ mod topology;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use graph::Topology;
 use runner::{ModelConfig, Runner, RunnerOptions, TaskInstance};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -43,6 +45,13 @@ enum Block {
 enum CliAggregator {
     Rule,
     Llm,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GraphKind {
+    Chain,
+    Ring,
+    ScatterGather,
 }
 
 #[derive(Subcommand)]
@@ -132,8 +141,40 @@ enum Command {
         backend: String,
         /// Grader model: defaults to Sonnet for stronger instruction-following
         /// (the solvers under test stay on whatever they ran with).
-        #[arg(long, default_value = "claude-sonnet-4-6")]
+        #[arg(long, default_value = "claude-sonnet-5")]
         model: Option<String>,
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+    },
+    /// Spawn and drive a graph topology (chain / ring / scatter-gather).
+    Graph {
+        /// Topology shape.
+        #[arg(long, value_enum)]
+        kind: GraphKind,
+        /// Number of nodes (workers, for scatter-gather).
+        #[arg(long, default_value_t = 4)]
+        n: usize,
+        /// Seed message / shared task.
+        #[arg(long)]
+        question: String,
+        /// Ring only: hop budget that bounds message-passing.
+        #[arg(long, default_value_t = 12)]
+        max_hops: usize,
+        /// Scatter-gather only: this many workers go missing (never reply).
+        #[arg(long, default_value_t = 0)]
+        fail_count: usize,
+        /// Scatter-gather only: this many workers reply with corrupted output.
+        #[arg(long, default_value_t = 0)]
+        corrupt_count: usize,
+        /// Scatter-gather only: drop the all-N barrier and gather on partial input.
+        #[arg(long)]
+        relaxed: bool,
+        /// Max agents resident/called at once (0 = unlimited).
+        #[arg(long, default_value_t = 0)]
+        max_concurrent: usize,
+        #[command(flatten)]
+        model: ModelArgs,
+        /// Per-wave reply timeout in seconds.
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
     },
@@ -271,6 +312,44 @@ fn main() -> Result<()> {
             })?;
             Ok(())
         }
+        Command::Graph {
+            kind,
+            n,
+            question,
+            max_hops,
+            fail_count,
+            corrupt_count,
+            relaxed,
+            max_concurrent,
+            model,
+            timeout_secs,
+        } => {
+            let topology = match kind {
+                GraphKind::Chain => Topology::Chain { n },
+                GraphKind::Ring => Topology::Ring { n, max_hops },
+                GraphKind::ScatterGather => Topology::ScatterGather {
+                    n,
+                    fail_count,
+                    corrupt_count,
+                    relaxed,
+                },
+            };
+            let task = TaskInstance {
+                id: format!("graph-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]),
+                question,
+                context: None,
+                tests: None,
+            };
+            let result = run_graph_once(
+                topology,
+                model.to_config(),
+                Duration::from_secs(timeout_secs),
+                max_concurrent,
+                &task,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         Command::DemoBlock {
             block,
             model,
@@ -316,6 +395,36 @@ fn run_once(
         runner.run_dir.root.display()
     );
     let result = runner.run_instance(task);
+    runner.teardown()?;
+    result
+}
+
+fn run_graph_once(
+    topology: Topology,
+    model: ModelConfig,
+    timeout: Duration,
+    max_concurrent: usize,
+    task: &TaskInstance,
+) -> Result<runner::GraphResult> {
+    let mut runner = Runner::setup_graph(
+        RunnerOptions {
+            topology: TopologyConfig::default(),
+            aggregator: AggregatorMode::Rule,
+            model,
+            timeout,
+            max_concurrent,
+            with_grader: false,
+            reset_each_problem: true,
+            run_root: None,
+        },
+        topology,
+    )?;
+    eprintln!(
+        "[mass] graph run {} ready; results under {}",
+        runner.run_id,
+        runner.run_dir.root.display()
+    );
+    let result = runner.run_graph(task, topology);
     runner.teardown()?;
     result
 }

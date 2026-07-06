@@ -2,9 +2,11 @@
 //! routes block waves through the mailbox, parses <answer>, tears agents down.
 
 use crate::blocks::{self, CallSpec};
+use crate::graph::{self, Topology};
 use crate::mailbox::{self, RunDir, WaitOutcome};
 use crate::math;
 use crate::omar::OmarClient;
+use crate::prompts;
 use crate::protocol::{self, Envelope, Reply, Role};
 use crate::topology::{AggregatorMode, SessionSpec, TopologyConfig};
 use anyhow::{bail, Context, Result};
@@ -36,6 +38,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2000);
 /// still-working agent is never interrupted.
 const DISPATCH_NUDGE_AFTER: Duration = Duration::from_secs(180);
 const DISPATCH_NUDGE_EVERY: Duration = Duration::from_secs(60);
+
+/// Garbage a corrupted worker returns instead of a real answer (sync tests).
+const CORRUPT_ANSWER: &str = "999";
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -107,6 +112,19 @@ pub struct InstanceResult {
     pub records: Vec<CallRecord>,
 }
 
+/// Outcome of driving a graph topology (chain / ring / scatter-gather).
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphResult {
+    pub topology: String,
+    /// Node firings that actually completed.
+    pub hops: usize,
+    /// Chain: reached the tail. Ring: self-terminated. Scatter-gather: gathered.
+    pub completed: bool,
+    pub reason: String,
+    pub output: Option<String>,
+    pub records: Vec<CallRecord>,
+}
+
 pub struct Runner {
     mcp: OmarClient,
     pub run_id: String,
@@ -172,11 +190,6 @@ impl Runner {
         opts.topology.validate()?;
         opts.topology.check_cap(opts.aggregator)?;
 
-        let run_id: String = uuid::Uuid::new_v4().simple().to_string()[..4].to_string();
-        let root = opts.run_root.clone().unwrap_or_else(default_run_root);
-        let run_dir = RunDir::create(root.join(&run_id))?;
-        let mut mcp = OmarClient::start()?;
-
         // Cap resident agents at max_concurrent; wider waves batch in dispatch.
         let mut sessions = cap_sessions(
             opts.topology.session_specs(opts.aggregator),
@@ -189,15 +202,29 @@ impl Runner {
                 slot: 0,
             });
         }
+        Runner::boot(opts, sessions)
+    }
+
+    /// Spawn a graph topology's node pool (chain / ring / scatter-gather).
+    pub fn setup_graph(opts: RunnerOptions, topology: Topology) -> Result<Runner> {
+        topology.validate()?;
+        Runner::boot(opts, topology.session_specs())
+    }
+
+    /// Create the run dir, spawn the given sessions, and block until all ready.
+    /// Tears down on any failure so a half-spawned run never leaks agents.
+    fn boot(opts: RunnerOptions, sessions: Vec<SessionSpec>) -> Result<Runner> {
+        let run_id: String = uuid::Uuid::new_v4().simple().to_string()[..4].to_string();
+        let root = opts.run_root.clone().unwrap_or_else(default_run_root);
+        let run_dir = RunDir::create(root.join(&run_id))?;
+        let mut mcp = OmarClient::start()?;
         let project_id = mcp.add_project(&format!("mass-{run_id}"))?;
         mcp.log_justification(
             "omar-mass",
             "mass_spawn_topology",
             &format!(
-                "Spawning {} MASS agents (topology {:?}, {} worst-case LLM calls/inference) for run {} to serve topology inference requests.",
+                "Spawning {} MASS agents for run {} to serve topology inference requests.",
                 sessions.len(),
-                opts.topology,
-                opts.topology.llm_calls(opts.aggregator),
                 run_id
             ),
         )?;
@@ -212,8 +239,6 @@ impl Runner {
             fresh: true,
             torn_down: false,
         };
-
-        // Tear down on any failure so a half-spawned run never leaks agents.
         if let Err(err) = runner.spawn_pool().and_then(|()| runner.ensure_ready()) {
             let _ = runner.teardown();
             return Err(err);
@@ -624,6 +649,182 @@ impl Runner {
         };
         mailbox::write_json_atomic(&self.run_dir.result(&sanitize_id(&task.id)), &result)?;
         Ok(result)
+    }
+
+    /// Drive a graph topology and return its outcome. Also persisted under
+    /// <run_dir>/results/<task_id>.json.
+    pub fn run_graph(&mut self, task: &TaskInstance, topology: Topology) -> Result<GraphResult> {
+        let result = match topology {
+            Topology::Chain { n } => self.run_chain(task, n)?,
+            Topology::Ring { n, max_hops } => self.run_ring(task, n, max_hops)?,
+            Topology::ScatterGather {
+                n,
+                fail_count,
+                corrupt_count,
+                relaxed,
+            } => self.run_scatter_gather(task, n, fail_count, corrupt_count, relaxed)?,
+        };
+        mailbox::write_json_atomic(&self.run_dir.result(&sanitize_id(&task.id)), &result)?;
+        Ok(result)
+    }
+
+    /// Relay the seed message head to tail; each node feeds the next.
+    fn run_chain(&mut self, task: &TaskInstance, n: usize) -> Result<GraphResult> {
+        let mut records = Vec::new();
+        let mut message = task.question.clone();
+        let mut hops = 0;
+        for idx in 1..=n {
+            let call = CallSpec {
+                role: Role::Node,
+                slot: idx,
+                round: 0,
+                payload: prompts::chain_node(idx, n, &message),
+            };
+            match self
+                .dispatch(&task.id, &[call], &mut records)?
+                .pop()
+                .flatten()
+            {
+                Some(content) => {
+                    message = protocol::parse_answer(&content).unwrap_or(content);
+                    hops += 1;
+                }
+                None => break, // a node stalled; the tail never produces
+            }
+        }
+        let completed = hops == n;
+        let reason = if completed {
+            "reached tail".to_string()
+        } else {
+            format!("stalled at node {}", hops + 1)
+        };
+        Ok(GraphResult {
+            topology: "chain".to_string(),
+            hops,
+            completed,
+            reason,
+            output: completed.then_some(message),
+            records,
+        })
+    }
+
+    /// Pass the message around the ring until a node stops it or the hop budget
+    /// runs out. Answers "does message-passing ever stop?".
+    fn run_ring(&mut self, task: &TaskInstance, n: usize, max_hops: usize) -> Result<GraphResult> {
+        let mut records = Vec::new();
+        let mut message = task.question.clone();
+        let mut hops = 0;
+        let mut stopped = false;
+        let mut stalled = false;
+        while hops < max_hops {
+            let idx = (hops % n) + 1;
+            let call = CallSpec {
+                role: Role::Node,
+                slot: idx,
+                round: hops / n,
+                payload: prompts::ring_node(idx, n, hops, &message),
+            };
+            match self
+                .dispatch(&task.id, &[call], &mut records)?
+                .pop()
+                .flatten()
+            {
+                Some(content) => {
+                    let out = protocol::parse_node(&content);
+                    if let Some(m) = out.message {
+                        message = m;
+                    }
+                    hops += 1;
+                    if out.stop {
+                        stopped = true;
+                        break;
+                    }
+                }
+                None => {
+                    stalled = true;
+                    break;
+                }
+            }
+        }
+        let reason = if stopped {
+            "self-terminated".to_string()
+        } else if stalled {
+            format!("stalled at hop {hops}")
+        } else {
+            "budget exhausted".to_string()
+        };
+        Ok(GraphResult {
+            topology: "ring".to_string(),
+            hops,
+            completed: stopped,
+            reason,
+            output: Some(message),
+            records,
+        })
+    }
+
+    /// Fan the task out to n workers, then gather. Strict fires only once ALL
+    /// have replied (the synchronization guarantee); relaxed fires on partial
+    /// input. The first `fail_count` workers go missing (never messaged); the
+    /// last `corrupt_count` reply but their answer is replaced with garbage.
+    fn run_scatter_gather(
+        &mut self,
+        task: &TaskInstance,
+        n: usize,
+        fail_count: usize,
+        corrupt_count: usize,
+        relaxed: bool,
+    ) -> Result<GraphResult> {
+        let mut records = Vec::new();
+        let corrupt_from = n - corrupt_count + 1; // slots >= this are corrupted
+        let live: Vec<usize> = (1..=n).filter(|slot| *slot > fail_count).collect();
+        let wave: Vec<CallSpec> = live
+            .iter()
+            .map(|&slot| CallSpec {
+                role: Role::Node,
+                slot,
+                round: 0,
+                payload: prompts::worker(slot, n, &task.question),
+            })
+            .collect();
+        let answers: Vec<String> = self
+            .dispatch(&task.id, &wave, &mut records)?
+            .into_iter()
+            .zip(&live)
+            .filter_map(|(reply, &slot)| {
+                reply.map(|c| {
+                    if corrupt_count > 0 && slot >= corrupt_from {
+                        CORRUPT_ANSWER.to_string()
+                    } else {
+                        protocol::parse_answer(&c).unwrap_or(c)
+                    }
+                })
+            })
+            .collect();
+        let arrived = answers.len();
+        let (fired, reason) = graph::gather_decision(arrived, n, relaxed);
+        let output = if fired {
+            let call = CallSpec {
+                role: Role::Node,
+                slot: n + 1,
+                round: 0,
+                payload: prompts::aggregator(&task.question, &answers),
+            };
+            self.dispatch(&task.id, &[call], &mut records)?
+                .pop()
+                .flatten()
+                .map(|c| protocol::parse_answer(&c).unwrap_or(c))
+        } else {
+            None
+        };
+        Ok(GraphResult {
+            topology: "scatter-gather".to_string(),
+            hops: arrived + fired as usize,
+            completed: fired,
+            reason,
+            output,
+            records,
+        })
     }
 
     /// LLM-judge grade: score a predicted answer against the gold solution.
