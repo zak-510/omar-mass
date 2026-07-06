@@ -51,14 +51,22 @@ pub fn refiner(
 }
 
 /// App. D Debator: sees all other agents' solutions, produces an updated answer.
+/// Sessions are stateless, so the agent's own previous solution rides along in
+/// the prompt too, explicitly marked (`own` is its index in `solutions`) — the
+/// paper's agents carry theirs in conversation memory instead.
 /// `slot` selects the same deterministic strategy hint as the predictor.
-pub fn debator(question: &str, solutions: &[String], slot: usize) -> String {
+pub fn debator(question: &str, solutions: &[String], own: usize, slot: usize) -> String {
     let mut listed = String::new();
     for (i, solution) in solutions.iter().enumerate() {
-        listed.push_str(&format!("[Agent {}] {}\n\n", i + 1, solution));
+        let label = if i == own {
+            "[Your previous solution]".to_string()
+        } else {
+            format!("[Agent {}]", i + 1)
+        };
+        listed.push_str(&format!("{} {}\n\n", label, solution));
     }
     format!(
-        "These are the solutions to the question from other agents. Examine the solutions from other agents in your rationale, finish by giving an updated answer.{hint} Keep all comparison of the other agents in your reasoning; the <answer> must be the self-contained final result only, never a reference to another agent by number or label. Show your final answer bracketed between <answer> and </answer> at the end.\n\n---\n\nFollow the following format.\n\nQuestion: ${{question}}\nSolutions: the solutions to the question from other agents\nReasoning: Let's think step by step in order to ${{Examine the solutions from other agents}}. We ...\nAnswer: The updated self-contained answer for the question, with no references to other agents. Do not repeat Answer:\n\n---\n\nQuestion: {question}\nSolutions:\n{listed}Reasoning: Let's think step by step in order to",
+        "These are the solutions to the question from the other agents, plus your own previous solution (marked). Examine the solutions from other agents in your rationale, finish by giving an updated answer.{hint} Keep all comparison of the other agents in your reasoning; the <answer> must be the self-contained final result only, never a reference to another agent by number or label. Show your final answer bracketed between <answer> and </answer> at the end.\n\n---\n\nFollow the following format.\n\nQuestion: ${{question}}\nSolutions: the solutions to the question from other agents\nReasoning: Let's think step by step in order to ${{Examine the solutions from other agents}}. We ...\nAnswer: The updated self-contained answer for the question, with no references to other agents. Do not repeat Answer:\n\n---\n\nQuestion: {question}\nSolutions:\n{listed}Reasoning: Let's think step by step in order to",
         hint = strategy_hint(slot),
     )
 }
@@ -91,13 +99,50 @@ pub fn executor(code: &str, tests: &str) -> String {
     )
 }
 
-/// Per-question-type grading rubric from the HARDMath eval (create_prompt.py).
+/// Chain node: process the incoming message and pass the whole thing along.
+pub fn chain_node(idx: usize, n: usize, message: &str) -> String {
+    format!(
+        "You are node {idx} of {n} in a processing chain. You received this message:\n\n{message}\n\nAppend a short note that node {idx} processed it, then pass the whole updated message on. Put the full updated message bracketed between <answer> and </answer>.",
+    )
+}
+
+/// Ring node: update the message and vote to keep passing or stop the ring.
+pub fn ring_node(idx: usize, n: usize, hop: usize, message: &str) -> String {
+    format!(
+        "You are node {idx} of {n} in a message-passing ring (hop {hop}). You received:\n\n{message}\n\nAppend 'node {idx}' to the trail, then decide whether the ring should keep passing the message. Put the updated message bracketed between <answer> and </answer>. End with a final line exactly 'Decision: PASS' to keep passing or 'Decision: STOP' to end the ring.",
+    )
+}
+
+/// Scatter worker: answer the shared task independently of the other workers.
+pub fn worker(idx: usize, n: usize, question: &str) -> String {
+    format!(
+        "You are worker {idx} of {n} answering a shared task independently. Task:\n\n{question}\n\nGive your answer bracketed between <answer> and </answer>.",
+    )
+}
+
+/// Grading rubrics verbatim from HARDMath's create_grading_prompt
 fn rubric(question_type: &str) -> &'static str {
     match question_type {
-        "polynomial_roots" | "polynomial_roots_corrections" => "Check both the small and large epsilon solutions. For each, give full credit if it matches the answer key; give partial credit proportional to the number of matching roots; give no credit if completely wrong. Average the two scores for a final score between 0 and 1.",
-        "ODE" => "Check both the small and large regime solutions. For the small regime give full credit only on an exact form match, else no credit. For the large regime give full credit on an exact match, partial credit if the form differs but the numerical value is close, no credit otherwise. Average the two scores for a final score between 0 and 1.",
-        "integral" => "Compare the response's analytical approximations against the answer key across the epsilon regimes. Give full credit if they match, partial credit for partially correct regimes, no credit if completely wrong. Final score between 0 and 1.",
+        "polynomial_roots" | "polynomial_roots_corrections" => "1) Check both the small and large $\\epsilon$ solutions. 2) For each solution, give full credit if it completely matches the elements in the answer key; give partial credit proportional to the number of matching roots between the response and the answer key; give no credit if it is completely wrong. 3) For both partial and no credit briefly state the error reason. 4) Average the scores for the small and large epsilon solutions to obtain a final score between 0 and 1.",
+        "integral" | "integral_traditional" => "1) Check both the small and large $\\epsilon$ solutions. 2) For each solution, give full credit if it matches the formula in the answer key; give no credit if it is completely wrong and briefly state the reason for the error. 3) Average the scores for the small and large epsilon solutions to obtain a final score between 0 and 1.",
+        "integral_laplace" => "1) Check the large $x$ final solution. 2) Give full credit if it matches the formula in the answer key; give half credit if the response get to the checkpoint where it correctly identifies \\(t_0\\) where $f$ attains its maximum and attempt performing Taylor's expansion around it but the final answer is wrong; give no credit if it is completely wrong. 3) For both partial and no credit briefly state the error reason.",
+        "ODE" => "1) Check both the small and large $\\epsilon$ solutions. 2) For small regime solution, only give full credit if it matches the formula in the answer key exactly; give no credit if it is doesn't match the form. For large regime solution, give full credit if it matches the formula in the answer key exactly; give partial credit if it doesn't match but the numerical evaluation is not far from solution at this regime; give no credit if neither satisfies. 3) Average the scores for the small and large epsilon solutions to obtain a final score between 0 and 1.",
         _ => "Give full credit (1.0) if the response's final expression is mathematically equivalent to the answer key, partial credit if close, and no credit (0.0) if wrong. Final score between 0 and 1.",
+    }
+}
+
+/// HARDMath grades integrals under two rubrics. The subtype is recoverable
+/// from the question text: Laplace problems ask for $I(x)$ (an $e^{\pm x f(t)}$
+/// kernel, large-$x$ asymptotics), traditional ones for $I(\epsilon)$.
+pub fn grading_type(question_type: &str, question: &str) -> String {
+    if question_type == "integral" {
+        if question.contains("I(x)") {
+            "integral_laplace".to_string()
+        } else {
+            "integral_traditional".to_string()
+        }
+    } else {
+        question_type.to_string()
     }
 }
 
@@ -182,15 +227,23 @@ mod tests {
 
     #[test]
     fn debator_lists_all_solutions() {
-        let d = debator("Q", &["sol a".into(), "sol b".into(), "sol c".into()], 1);
-        assert!(d.contains("[Agent 1] sol a"));
+        let sols = vec!["sol a".into(), "sol b".into(), "sol c".into()];
+        let d = debator("Q", &sols, 0, 1);
+        // The recipient's own solution is marked, never passed off as another agent's.
+        assert!(d.contains("[Your previous solution] sol a"));
+        assert!(!d.contains("[Agent 1]"));
+        assert!(d.contains("[Agent 2] sol b"));
         assert!(d.contains("[Agent 3] sol c"));
         assert!(d.contains("<answer>"));
         // <answer> must stay a self-contained result, no agent-reference leak.
         assert!(d.contains("self-contained final result only"));
+        // A different recipient gets its own slot marked instead.
+        let d2 = debator("Q", &sols, 2, 3);
+        assert!(d2.contains("[Agent 1] sol a"));
+        assert!(d2.contains("[Your previous solution] sol c"));
         // Slot 1 neutral; slot 2 carries the strategy hint.
         assert!(!d.contains("numerical approach"));
-        assert!(debator("Q", &["x".into()], 2).contains("numerical approach"));
+        assert!(debator("Q", &["x".into()], 0, 2).contains("numerical approach"));
     }
 
     #[test]
@@ -208,14 +261,30 @@ mod tests {
     }
 
     #[test]
+    fn graph_node_prompts_carry_role_and_message() {
+        let c = chain_node(2, 5, "payload");
+        assert!(c.contains("node 2 of 5"));
+        assert!(c.contains("payload"));
+        assert!(c.contains("<answer>"));
+        let r = ring_node(3, 4, 7, "trail");
+        assert!(r.contains("ring (hop 7)"));
+        assert!(r.contains("Decision: PASS"));
+        assert!(r.contains("Decision: STOP"));
+        let w = worker(1, 3, "solve me");
+        assert!(w.contains("worker 1 of 3"));
+        assert!(w.contains("solve me"));
+    }
+
+    #[test]
     fn judge_batch_anonymizes_and_demands_independent_scores() {
         let j = judge_batch(&["ans one".into(), "ans two".into()], "gold", "integral");
         assert!(j.contains("[Answer A]\nans one"));
         assert!(j.contains("[Answer B]\nans two"));
         assert!(j.contains("never relative to the other answers"));
         assert!(j.contains("A: <0-1>, B: <0-1>"));
-        assert!(j.contains("epsilon regimes")); // integral rubric carried
-                                                // No method names leak into the prompt.
+        // Traditional-integral rubric carried.
+        assert!(j.contains("give full credit if it matches the formula in the answer key"));
+        // No method names leak into the prompt.
         assert!(!j.to_lowercase().contains("cot") && !j.contains("debate"));
     }
 
@@ -227,9 +296,40 @@ mod tests {
         assert!(j.contains("small and large epsilon"));
         assert!(j.contains("<answer>"));
         // Unknown type falls back to the equivalence rubric.
-        assert!(judge("a", "b", "integral").contains("epsilon regimes"));
         assert!(
             judge("a", "b", "nondimensionalization_numeric").contains("mathematically equivalent")
         );
+    }
+
+    #[test]
+    fn rubrics_are_verbatim_hardmath() {
+        // ODE keeps the source's harsh small-regime clause (exact form or zero)
+        // and the numeric-closeness partial credit only on the large regime.
+        let ode = rubric("ODE");
+        assert!(ode
+            .contains("only give full credit if it matches the formula in the answer key exactly"));
+        assert!(ode.contains("partial credit if it doesn't match but the numerical evaluation is not far from solution"));
+        // Roots: proportional partial credit, corrections reuse it.
+        let roots = rubric("polynomial_roots");
+        assert!(roots.contains("partial credit proportional to the number of matching roots"));
+        assert_eq!(roots, rubric("polynomial_roots_corrections"));
+        // Integral splits by subtype: traditional is exact-or-nothing per regime,
+        // laplace has the half-credit Taylor checkpoint.
+        assert!(rubric("integral_traditional").contains("give no credit if it is completely wrong"));
+        assert_eq!(rubric("integral"), rubric("integral_traditional"));
+        assert!(rubric("integral_laplace").contains("Taylor's expansion"));
+        assert!(rubric("integral_laplace").contains("half credit"));
+    }
+
+    #[test]
+    fn grading_type_splits_integral_subtypes_only() {
+        let laplace_q = r"Consider the integral \begin{equation} I(x) = \int (- 1.3 t^{5}) e^{- x (1.5 \sin{(t)})} dt \end{equation}";
+        let trad_q =
+            r"Consider the integral $I(\epsilon) = \int_0^{98} \frac{1}{\epsilon + x^4} dx$.";
+        assert_eq!(grading_type("integral", laplace_q), "integral_laplace");
+        assert_eq!(grading_type("integral", trad_q), "integral_traditional");
+        // Every other type passes through untouched.
+        assert_eq!(grading_type("ODE", laplace_q), "ODE");
+        assert_eq!(grading_type("polynomial_roots", trad_q), "polynomial_roots");
     }
 }

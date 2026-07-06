@@ -16,6 +16,8 @@ pub enum Role {
     Summarizer,
     Executor,
     Grader,
+    /// Generic worker for graph topologies (chain / ring / scatter-gather).
+    Node,
 }
 
 impl Role {
@@ -30,6 +32,7 @@ impl Role {
             Role::Summarizer => "sum",
             Role::Executor => "exec",
             Role::Grader => "grade",
+            Role::Node => "node",
         }
     }
 }
@@ -315,6 +318,29 @@ pub fn parse_reflection(text: &str) -> Reflection {
     Reflection { correct, feedback }
 }
 
+/// Graph node output: the message to forward plus a stop vote (ring termination).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeOutput {
+    pub message: Option<String>,
+    pub stop: bool,
+}
+
+/// Parse a graph node reply: `message` is the `<answer>` payload; `stop` is true
+/// when the last `Decision:` line says "stop".
+pub fn parse_node(text: &str) -> NodeOutput {
+    let mut stop = false;
+    for line in text.lines() {
+        let trimmed = line.trim().trim_start_matches(['*', '#', ' ']);
+        if let Some(rest) = strip_prefix_ci(trimmed, "decision:") {
+            stop = rest.to_lowercase().contains("stop");
+        }
+    }
+    NodeOutput {
+        message: parse_answer(text),
+        stop,
+    }
+}
+
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     // get(..len) is None at a non-char-boundary, so multibyte heads can't panic.
     let head = s.get(..prefix.len())?;
@@ -470,6 +496,17 @@ mod tests {
                                                    // Fractions must not truncate to the numerator.
         assert_eq!(parse_score("<answer>1/2</answer>"), Some(0.5));
         assert_eq!(parse_score("Grade: 1/4"), Some(0.25));
+    }
+
+    #[test]
+    fn parse_node_reads_message_and_stop_vote() {
+        let pass = parse_node("trail: A>B <answer>A>B>C</answer>\nDecision: PASS");
+        assert_eq!(pass.message.as_deref(), Some("A>B>C"));
+        assert!(!pass.stop);
+        let stop = parse_node("<answer>done</answer>\nDecision: STOP");
+        assert!(stop.stop);
+        // No decision line defaults to passing (bounded by the hop budget).
+        assert!(!parse_node("<answer>x</answer>").stop);
     }
 
     #[test]

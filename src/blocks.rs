@@ -121,22 +121,17 @@ pub fn debate_wave(
     texts: &[String],
     alive: &[bool],
 ) -> Vec<CallSpec> {
-    let solutions: Vec<String> = texts
-        .iter()
+    let live: Vec<usize> = (0..texts.len()).filter(|&i| alive[i]).collect();
+    let solutions: Vec<String> = live.iter().map(|&i| texts[i].clone()).collect();
+    live.iter()
         .enumerate()
-        .filter(|(i, _)| alive[*i])
-        .map(|(_, t)| t.clone())
-        .collect();
-    texts
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| alive[*i])
-        .map(|(i, _)| CallSpec {
+        .map(|(own, &i)| CallSpec {
             role: Role::Debator,
             slot: i + 1,
             round,
-            // Per-slot strategy hint keyed by chain index for deterministic diversity.
-            payload: prompts::debator(question, &solutions, i + 1),
+            // Per-slot strategy hint keyed by chain index for deterministic diversity;
+            // `own` marks the chain's previous solution as its own, not another agent's.
+            payload: prompts::debator(question, &solutions, own, i + 1),
         })
         .collect()
 }
@@ -243,6 +238,11 @@ mod tests {
             assert!(call.payload.contains("sol-b"));
             assert!(call.payload.contains("sol-c"));
         }
+        // Each debator's own solution is marked as its own, the rest as agents.
+        assert!(wave[0].payload.contains("[Your previous solution] sol-a"));
+        assert!(wave[0].payload.contains("[Agent 2] sol-b"));
+        assert!(wave[2].payload.contains("[Your previous solution] sol-c"));
+        assert!(wave[2].payload.contains("[Agent 1] sol-a"));
     }
 
     #[test]
@@ -252,6 +252,9 @@ mod tests {
         assert_eq!(wave.len(), 2);
         assert_eq!(wave[1].slot, 3);
         assert!(!wave[0].payload.contains("dead"));
+        // Own-marking tracks the compacted live list, not the raw chain index.
+        assert!(wave[1].payload.contains("[Your previous solution] sol-c"));
+        assert!(wave[1].payload.contains("[Agent 1] sol-a"));
     }
 
     #[test]
