@@ -25,6 +25,7 @@ pub enum Method {
     Debate,
 }
 
+
 impl Method {
     pub fn preset(&self) -> (TopologyConfig, AggregatorMode) {
         match self {
@@ -347,7 +348,10 @@ pub fn run_bench(args: BenchArgs) -> Result<BenchSummary> {
                             &problem.id,
                             a,
                             &problem.solution,
-                            &problem.question_type,
+                            &crate::prompts::grading_type(
+                                &problem.question_type,
+                                &problem.question,
+                            ),
                         ) {
                             Some(s) => s,
                             // Surface a grader parse failure instead of burying a

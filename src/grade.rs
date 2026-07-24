@@ -56,6 +56,21 @@ fn mean(vals: impl Iterator<Item = f64>) -> f64 {
     }
 }
 
+/// Method -> score map for one problem, or None if any label came back
+/// unparseable, the problem stays ungraded so a re-run retries it, instead
+/// of baking a false 0.0 into the report forever.
+fn collect_scores(
+    entries: &[(String, String)],
+    order: &[usize],
+    scores: &[Option<f64>],
+) -> Option<BTreeMap<String, f64>> {
+    let mut tmap = BTreeMap::new();
+    for (pos, &i) in order.iter().enumerate() {
+        tmap.insert(entries[i].0.clone(), scores.get(pos).copied().flatten()?);
+    }
+    Some(tmap)
+}
+
 impl GradeReport {
     fn accuracy(&self, method: &str) -> f64 {
         mean(self.scores.values().filter_map(|m| m.get(method).copied()))
@@ -78,9 +93,20 @@ impl GradeReport {
 
 pub fn run_grade(args: GradeArgs) -> Result<GradeReport> {
     let problems = bench::load_problems(&args.data)?;
-    let meta: BTreeMap<String, (String, String)> = problems
+    // (solution, question_type for reporting, grading type for the rubric —
+    // integrals split into traditional/laplace subtypes).
+    let meta: BTreeMap<String, (String, String, String)> = problems
         .iter()
-        .map(|p| (p.id.clone(), (p.solution.clone(), p.question_type.clone())))
+        .map(|p| {
+            (
+                p.id.clone(),
+                (
+                    p.solution.clone(),
+                    p.question_type.clone(),
+                    crate::prompts::grading_type(&p.question_type, &p.question),
+                ),
+            )
+        })
         .collect();
 
     // Load each method's predictions (saved by `bench --no-grade`).
@@ -146,7 +172,7 @@ pub fn run_grade(args: GradeArgs) -> Result<GradeReport> {
         })?;
 
         for task in &todo {
-            let (solution, qt) = match meta.get(task) {
+            let (solution, qt, gtype) = match meta.get(task) {
                 Some(m) => m,
                 None => {
                     eprintln!("[grade] WARN no dataset entry for {task}; skipping");
@@ -160,12 +186,18 @@ pub fn run_grade(args: GradeArgs) -> Result<GradeReport> {
                 .collect();
             let order = shuffled_indices(entries.len(), task);
             let answers: Vec<String> = order.iter().map(|&i| entries[i].1.clone()).collect();
-            let scores = runner.grade_batch(task, &answers, solution, qt);
+            let scores = runner.grade_batch(task, &answers, solution, gtype);
 
-            let mut tmap = BTreeMap::new();
-            for (pos, &i) in order.iter().enumerate() {
-                tmap.insert(entries[i].0.clone(), scores[pos].unwrap_or(0.0));
-            }
+            let tmap = match collect_scores(&entries, &order, &scores) {
+                Some(t) => t,
+                None => {
+                    eprintln!(
+                        "[grade] WARN {task}: judge gave no parseable score for some answers; \
+                         left ungraded so a re-run retries it"
+                    );
+                    continue;
+                }
+            };
             eprintln!("[grade] {task}: {tmap:?}");
             report.types.insert(task.clone(), qt.clone());
             report.scores.insert(task.clone(), tmap);
@@ -198,6 +230,21 @@ mod tests {
         // Different tasks generally differ; at least one of two does.
         let b = shuffled_indices(4, "ODE-000");
         assert!(a != b || shuffled_indices(4, "integral-000") != a);
+    }
+
+    #[test]
+    fn collect_scores_maps_back_through_shuffle_and_rejects_missing() {
+        let entries = vec![
+            ("cot".to_string(), "p1".to_string()),
+            ("debate".to_string(), "p2".to_string()),
+        ];
+        // Shuffled order [1, 0]: position 0 holds debate, position 1 holds cot.
+        let tmap = collect_scores(&entries, &[1, 0], &[Some(0.25), Some(1.0)]).unwrap();
+        assert_eq!(tmap["debate"], 0.25);
+        assert_eq!(tmap["cot"], 1.0);
+        // Any unparseable label leaves the whole problem ungraded (retry later),
+        // never a silent 0.0.
+        assert!(collect_scores(&entries, &[1, 0], &[Some(0.25), None]).is_none());
     }
 
     #[test]
